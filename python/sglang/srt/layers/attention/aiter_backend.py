@@ -1342,11 +1342,13 @@ class AiterAttnBackend(AttentionBackend):
             )
 
             # TODO kkhuang-amd need to remove it when paged_attention_ragged support fp8-kv
+            """
             if self.kv_cache_dtype == fp8_dtype:
                 dtype = q.dtype
 
                 k_cache = k_cache.to(dtype)
                 v_cache = v_cache.to(dtype)
+            """
 
             paged_attention_ragged(
                 o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -1361,7 +1363,7 @@ class AiterAttnBackend(AttentionBackend):
                 1,
                 self.max_num_partitions,
                 None,
-                "auto",
+                "fp8_e4m3" if self.kv_cache_dtype == fp8_dtype else "auto",
                 "NHD",
                 self.logits_soft_cap,
                 self.k_scale,
