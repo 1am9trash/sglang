@@ -2319,11 +2319,18 @@ class ServerArgs:
 
             # Check TP size
             if self.tp_size > 1:
-                os.environ["NCCL_ALGO"] = "allreduce:tree"
-                self.disable_custom_all_reduce = True
-                logger.warning(
-                    "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
-                )
+                if is_hip():
+                    os.environ["ROCM_QUICK_REDUCE_QUANTIZATION"] = "FP"
+                    os.environ["ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16"] = "0"
+                    logger.warning(
+                        "Testing with QUICK REDUCE"
+                    )
+                else:
+                    os.environ["NCCL_ALGO"] = "allreduce:tree"
+                    self.disable_custom_all_reduce = True
+                    logger.warning(
+                        "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
+                    )
 
     def _handle_request_metrics_exporters(self):
         """Handle arguments for configuring `RequestMetricsExporter` usage."""
