@@ -99,7 +99,7 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
                 2,
                 3,
                 5,
-            ], "For tuple input, only (x, x_s), (x, x_s, y), or (x, y_kpe, S1, S2, out_dtype) formats are accepted"
+            ], "For tuple input, only (x, x_s), (x, x_s, y), or (x, y, S1, S2, out_dtype) formats are accepted"
             if len(x) == 2:
                 x, x_s = x
             elif len(x) == 3:
