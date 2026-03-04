@@ -766,12 +766,12 @@ def sparse_mla_fwd_decode_partial(
                 T.copy(acc_s, S_shared)
                 T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullCol)
 
-            # sumexp_i==0 (all masked), divide by 1 to get 0 and avoid nan
+            # sumexp==0 (all masked), divide by 1 to get 0 and avoid nan
             for h_i, d_i in T.Parallel(H_per_block, D):
                 acc_o[h_i, d_i] = acc_o[h_i, d_i] / T.if_then_else(
                     sumexp[h_i] == 0.0, 1.0, sumexp[h_i]
                 )
-            # sumexp_i==0 (all masked), use large negative so combine ignores this split
+            # sumexp==0 (all masked), use large negative so combine ignores this split
             for h_i in T.Parallel(H_per_block):
                 sumexp[h_i] = T.if_then_else(
                     sumexp[h_i] == 0.0,
