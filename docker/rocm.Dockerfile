@@ -57,7 +57,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.10.post3"
+ENV AITER_COMMIT="417de6df4392120b766537efd50c7725cfa0d5af"
 
 # ===============================
 # Chosen arch and args
