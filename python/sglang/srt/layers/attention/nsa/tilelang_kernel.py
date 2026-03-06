@@ -716,15 +716,14 @@ def sparse_mla_fwd_decode_partial(
                 for bi_i in T.Parallel(BI):
                     mask[bi_i] = Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i] >= 0
                 for bi_i, d_i in T.Parallel(BI, D):
+                    idx = Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i]
                     KV_shared[bi_i, d_i] = KV[
-                        b_i, Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i], g_i, d_i
+                        b_i, T.if_then_else(idx >= 0, idx, 0), g_i, d_i
                     ]
                 for bi_i, d_i in T.Parallel(BI, D_tail):
+                    idx = Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i]
                     K_tail_shared[bi_i, d_i] = KV[
-                        b_i,
-                        Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i],
-                        g_i,
-                        D + d_i,
+                        b_i, T.if_then_else(idx >= 0, idx, 0), g_i, D + d_i
                     ]
 
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
@@ -749,8 +748,6 @@ def sparse_mla_fwd_decode_partial(
 
                 T.copy(m_i, m_i_prev)
                 T.reduce_max(acc_s, m_i, dim=1, clear=False)
-                for h_i in T.Parallel(H_per_block):
-                    m_i[h_i] = T.max(m_i[h_i], m_i_prev[h_i])
                 for h_i in T.Parallel(H_per_block):
                     alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
