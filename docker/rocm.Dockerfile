@@ -172,6 +172,7 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 # leak into AITER's version when AITER uses setuptools_scm)
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=
 RUN pip uninstall -y aiter \
+ && pip install flydsl==0.0.1.dev95158637 \
  && pip install psutil pybind11 # Required by AITER setup.py
 RUN git clone ${AITER_REPO} \
  && cd aiter \
