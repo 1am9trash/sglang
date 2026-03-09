@@ -786,7 +786,7 @@ class AiterAttnBackend(AttentionBackend):
                         is_causal=True,
                     )
 
-                    total_s = int(forward_batch.extend_seq_lens.sum())
+                    total_s = forward_batch.seq_lens_sum
                     fp8_prefill_kv_indices = torch.arange(
                         total_s, device=self.device, dtype=torch.int32
                     )
