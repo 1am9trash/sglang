@@ -1532,77 +1532,11 @@ class AiterAttnBackend(AttentionBackend):
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
                 if kv_indices.shape[0] == 0 or extend_no_prefix:
                     if _use_fp8_prefill_attn:
-                        total_s = q.shape[0]
-                        nhead = layer.tp_q_head_num
-                        v_head_dim = layer.v_head_dim
-
-                        # q is cast here (after RoPE).
-                        # k/v are already FP8 for MXFP4 main model (fused kv_b_proj),
-                        # but need casting for FP8/BF16 weights (e.g. MTP draft model).
-                        if q.dtype != fp8_dtype:
-                            q = q.to(fp8_dtype)
-                        if k.dtype != fp8_dtype:
-                            k = k.to(fp8_dtype)
-                        if v.dtype != fp8_dtype:
-                            v = v.to(fp8_dtype)
-                        one_scale = torch.ones((), dtype=torch.float32, device=q.device)
-
-                        kv_indptr_asm = qo_indptr
-                        kv_indices_asm = self.forward_metadata.fp8_prefill_kv_indices
-
-                        tile_q = 256
-                        reduce_indptr = self.forward_metadata.reduce_indptr
-                        reduce_final_map = self.forward_metadata.reduce_final_map
-                        reduce_partial_map = self.forward_metadata.reduce_partial_map
-
-                        logits = torch.empty(
-                            (reduce_partial_map.size(0) * tile_q, nhead, v_head_dim),
-                            dtype=torch.float32,
-                            device=q.device,
-                        )
-                        attn_lse = torch.empty(
-                            (reduce_partial_map.size(0) * tile_q, nhead),
-                            dtype=torch.float32,
-                            device=q.device,
-                        )
-                        final_lse = torch.empty(
-                            (total_s, nhead),
-                            dtype=torch.float32,
-                            device=q.device,
-                        )
-                        output = q.new_empty(
-                            (total_s, nhead, v_head_dim),
-                            dtype=self.input_dtype,
-                        )
-
-                        mla_prefill_ps_asm_fwd(
+                        output = self.mla_fp8_prefill_attn(
                             q,
                             k,
                             v,
-                            qo_indptr,
-                            kv_indptr_asm,
-                            kv_indices_asm,
-                            self.forward_metadata.work_indptr,
-                            self.forward_metadata.work_info_set,
-                            max_q_len,
-                            layer.scaling,
-                            True,
-                            logits,
-                            attn_lse,
-                            output,
-                            one_scale,
-                            one_scale,
-                            one_scale,
-                        )
-                        mla_reduce_v1(
-                            logits,
-                            attn_lse,
-                            reduce_indptr,
-                            reduce_final_map,
-                            reduce_partial_map,
-                            tile_q,
-                            output,
-                            final_lse,
+                            layer,
                         )
                     else:
                         output = flash_attn_varlen_func(
