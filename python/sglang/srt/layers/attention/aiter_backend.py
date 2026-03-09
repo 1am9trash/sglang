@@ -749,6 +749,7 @@ class AiterAttnBackend(AttentionBackend):
 
                 max_q_len = self.mla_indices_updater_prefill.max_q_len
                 qo_indptr = self.mla_indices_updater_prefill.qo_indptr
+                kv_indptr = self.mla_indices_updater_prefill.kv_indptr
 
                 work_metadata = None
                 work_indptr = None
@@ -774,7 +775,7 @@ class AiterAttnBackend(AttentionBackend):
 
                     self.make_mla_prefill_ps_meta_data(
                         qo_indptr,
-                        qo_indptr,
+                        kv_indptr,
                         forward_batch.seq_lens,
                         work_metadata,
                         work_indptr,
