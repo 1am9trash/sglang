@@ -1563,44 +1563,61 @@ class AiterAttnBackend(AttentionBackend):
                         kvc = kvc.to(dtype)
                         k_pe = k_pe.to(dtype)
 
-                    kvprefix = layer.kv_b_proj(kvc.contiguous())[0]
+                    if (
+                        _use_fp8_prefill_attn
+                        and layer.kv_b_proj.weight.dtype == torch.uint8
+                    ):
+                        # MXFP4 weights + FP8 prefill: fuse GEMM, nope/v split, and k_pe cat
+                        # into a single kernel (fused_gemm_afp4wfp4_split_cat) that writes k and v
+                        # directly in FP8, avoiding a separate elementwise cast
+                        k, v = layer.kv_b_proj(
+                            (
+                                kvc.squeeze(1),
+                                k_pe.expand(-1, layer.tp_k_head_num, -1),
+                                qk_nope_head_dim,
+                                layer.v_head_dim,
+                                fp8_dtype,
+                            )
+                        )[0]
+                    else:
+                        kv = layer.kv_b_proj(kvc.contiguous())[0]
 
-                    kvprefix = kvprefix.view(
-                        -1, layer.tp_k_head_num, qk_nope_head_dim + layer.v_head_dim
-                    )
-                    k_prefix, v_prefix = torch.split(
-                        kvprefix, [qk_nope_head_dim, layer.v_head_dim], dim=-1
-                    )
-                    k_prefix = torch.cat(
-                        [
-                            k_prefix,
-                            torch.broadcast_to(
-                                k_pe,
-                                (k_pe.shape[0], layer.tp_k_head_num, k_pe.shape[2]),
-                            ),
-                        ],
-                        dim=-1,
-                    )
+                        kv = kv.view(
+                            -1, layer.tp_k_head_num, qk_nope_head_dim + layer.v_head_dim
+                        )
+                        k, v = torch.split(
+                            kv, [qk_nope_head_dim, layer.v_head_dim], dim=-1
+                        )
+                        k = torch.cat(
+                            [
+                                k,
+                                torch.broadcast_to(
+                                    k_pe,
+                                    (k_pe.shape[0], layer.tp_k_head_num, k_pe.shape[2]),
+                                ),
+                            ],
+                            dim=-1,
+                        )
+
                     assert (
                         forward_batch.extend_prefix_lens.shape
                         == forward_batch.extend_seq_lens.shape
                     )
 
-                    k = k_prefix
-                    v = v_prefix
-
-                    o = flash_attn_varlen_func(
-                        q,
-                        k,
-                        v,
-                        qo_indptr,
-                        kv_indptr,
-                        max_q_len,
-                        max_kv_len,
-                        softmax_scale=layer.scaling,
-                        causal=True,
-                    )
-                    return o
+                    if _use_fp8_prefill_attn:
+                        return self.mla_fp8_prefill_attn(q, k, v, layer)
+                    else:
+                        return flash_attn_varlen_func(
+                            q,
+                            k,
+                            v,
+                            qo_indptr,
+                            kv_indptr,
+                            max_q_len,
+                            max_kv_len,
+                            softmax_scale=layer.scaling,
+                            causal=True,
+                        )
 
                 else:
                     if layer.qk_head_dim != layer.v_head_dim:
