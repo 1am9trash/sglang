@@ -432,6 +432,81 @@ class AiterAttnBackend(AttentionBackend):
             is_causal=is_causal,
         )
 
+    def mla_fp8_prefill_attn(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+    ):
+        total_q = q.shape[0]
+        nhead = layer.tp_q_head_num
+        v_head_dim = layer.v_head_dim
+
+        if q.dtype != fp8_dtype:
+            q = q.to(fp8_dtype)
+        if k.dtype != fp8_dtype:
+            k = k.to(fp8_dtype)
+        if v.dtype != fp8_dtype:
+            v = v.to(fp8_dtype)
+        one_scale = torch.ones((), dtype=torch.float32, device=q.device)
+
+        tile_q = 256
+        reduce_indptr = self.forward_metadata.reduce_indptr
+        reduce_final_map = self.forward_metadata.reduce_final_map
+        reduce_partial_map = self.forward_metadata.reduce_partial_map
+
+        logits = torch.empty(
+            (reduce_partial_map.size(0) * tile_q, nhead, v_head_dim),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        attn_lse = torch.empty(
+            (reduce_partial_map.size(0) * tile_q, nhead),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        final_lse = torch.empty(
+            (total_q, nhead),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        output = q.new_empty(
+            (total_q, nhead, v_head_dim),
+            dtype=self.input_dtype,
+        )
+
+        mla_prefill_ps_asm_fwd(
+            q,
+            k,
+            v,
+            self.forward_metadata.qo_indptr,
+            self.forward_metadata.kv_indptr,
+            self.forward_metadata.fp8_prefill_kv_indices,
+            self.forward_metadata.work_indptr,
+            self.forward_metadata.work_info_set,
+            self.forward_metadata.max_q_len,
+            layer.scaling,
+            True,
+            logits,
+            attn_lse,
+            output,
+            one_scale,
+            one_scale,
+            one_scale,
+        )
+        mla_reduce_v1(
+            logits,
+            attn_lse,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            tile_q,
+            output,
+            final_lse,
+        )
+        return output
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
 
