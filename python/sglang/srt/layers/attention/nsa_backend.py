@@ -333,6 +333,12 @@ class NativeSparseAttnBackend(
                 dtype=torch.int32,
                 device=self.device,
             )
+            # Aiter mla_decode_fwd supports num_heads multiples of 16 in range [16, 128].
+            # For models with fewer heads per GPU (e.g. GLM-5 64 heads / TP8 = 8), need to pad the heads to 16.
+            self.need_pad_heads = self.num_q_heads < 16
+            self.head_repeat_factor = (
+                16 // self.num_q_heads if self.num_q_heads < 16 else 1
+            )
 
         # Speculative decoding
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
@@ -1814,6 +1820,21 @@ class NativeSparseAttnBackend(
         else:
             o = torch.empty_like(q)
 
+        if self.need_pad_heads:
+            q_kernel = q.view(
+                -1, layer.tp_q_head_num, layer.head_dim
+            ).repeat_interleave(self.head_repeat_factor, dim=1)
+            o_kernel = q.new_empty(
+                (
+                    q.shape[0],
+                    layer.tp_q_head_num * self.head_repeat_factor,
+                    layer.v_head_dim,
+                )
+            )
+        else:
+            q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+            o_kernel = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+
         kv_indptr = self.kv_indptr
 
         non_minus1_mask = page_table_1 != -1
@@ -1824,9 +1845,9 @@ class NativeSparseAttnBackend(
         get_valid_kv_indices(page_table_1, kv_indptr, kv_indices, bs)
 
         mla_decode_fwd(
-            q.view(-1, layer.tp_q_head_num, layer.head_dim),
+            q_kernel,
             kv_cache.view(-1, 1, 1, layer.head_dim),
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            o_kernel,
             metadata.cu_seqlens_q,
             kv_indptr,
             kv_indices,
@@ -1835,7 +1856,10 @@ class NativeSparseAttnBackend(
             sm_scale=layer.scaling,
             logit_cap=layer.logit_cap,
         )
-        # kv_cache = kv_cache.view(-1, 1, layer.head_dim)
+
+        if self.need_pad_heads:
+            o = o_kernel[:, :: self.head_repeat_factor, :]
+
         return o
 
     def _forward_aiter_extend(
@@ -1852,6 +1876,21 @@ class NativeSparseAttnBackend(
             o = q.new_empty((num_tokens, layer.tp_q_head_num * layer.v_head_dim))
         else:
             o = torch.empty_like(q)
+
+        if self.need_pad_heads:
+            q_kernel = q.view(
+                -1, layer.tp_q_head_num, layer.head_dim
+            ).repeat_interleave(self.head_repeat_factor, dim=1)
+            o_kernel = q.new_empty(
+                (
+                    num_tokens,
+                    layer.tp_q_head_num * self.head_repeat_factor,
+                    layer.v_head_dim,
+                )
+            )
+        else:
+            q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+            o_kernel = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
         non_minus1_mask = page_table_1 != -1
         non_minus1_counts = non_minus1_mask.sum(dim=1)
@@ -1874,9 +1913,9 @@ class NativeSparseAttnBackend(
         )
         # TODO support more forward_mode
         mla_decode_fwd(
-            q.view(-1, layer.tp_q_head_num, layer.head_dim),
+            q_kernel,
             kv_cache.view(-1, 1, 1, layer.head_dim),
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            o_kernel,
             cu_seqlens_q,
             kv_indptr,
             kv_indices,
@@ -1885,6 +1924,10 @@ class NativeSparseAttnBackend(
             sm_scale=layer.scaling,
             logit_cap=layer.logit_cap,
         )
+
+        if self.need_pad_heads:
+            o = o_kernel[:, :: self.head_repeat_factor, :]
+
         return o
 
     def _forward_trtllm(
