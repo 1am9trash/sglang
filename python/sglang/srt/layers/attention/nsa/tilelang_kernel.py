@@ -1037,6 +1037,326 @@ def sparse_mla_fwd_decode_combine(
     return main
 
 
+@tilelang.jit(out_idx=[-2, -1], pass_configs=pass_configs)
+def sparse_mla_fwd_decode_partial_fp8_wo_scale_2stage(
+    num_heads: int,
+    d_v: int,
+    d_tail: int,
+    topk: int,
+    *,
+    sm_scale=None,
+    block_I=64,
+    inner_iter=1,
+    threads=256,
+    group_size: int = 128,
+):
+    BI = block_I
+    num_tiles = d_v // group_size
+    assert num_tiles == 4, "frag4 kernel assumes d_v=512 and group_size=128"
+    dim_quant_fp8 = d_v + d_tail
+    rope_offset_fp8 = d_v
+    fp8_max_val = 240.0 if _is_fp8_fnuz else 448.0
+
+    assert topk % BI == 0
+    assert topk % (BI * inner_iter) == 0
+    n_groups = topk // (BI * inner_iter)
+
+    if sm_scale is None:
+        sm_scale = (1.0 / (d_v + d_tail)) ** 0.5 * 1.44269504
+    else:
+        sm_scale = sm_scale * 1.44269504
+
+    head_kv = num_heads
+    padded_h = max(tilelang.math.next_power_of_2(head_kv), 16)
+    replicate_h = (head_kv // 64) if head_kv > 64 else 1
+    h_per_block = padded_h if replicate_h == 1 else 64
+
+    seq_len = T.symbolic("seq_len")
+    num_pages = T.symbolic("num_pages")
+
+    q_fp8_shape = [seq_len, num_heads, d_v]
+    q_tail_shape = [seq_len, num_heads, d_tail]
+    kv_fp8_shape = [num_pages, dim_quant_fp8]
+    idx_shape = [seq_len, topk]
+    partial_o_shape = [seq_len, n_groups, num_heads, d_v]
+    partial_lse_shape = [seq_len, n_groups, num_heads]
+
+    accum_dtype = T.float32
+    dtype_bf16 = T.bfloat16
+
+    @T.prim_func
+    def main(
+        q_fp8_cast: T.Tensor(q_fp8_shape, FP8),
+        q_tail: T.Tensor(q_tail_shape, FP8),
+        kv_fp8: T.Tensor(kv_fp8_shape, FP8),
+        indices: T.Tensor(idx_shape, T.int32),
+        partial_o: T.Tensor(partial_o_shape, dtype_bf16),
+        partial_lse: T.Tensor(partial_lse_shape, accum_dtype),
+    ):
+        with T.Kernel(seq_len * replicate_h, n_groups, threads=threads) as (bx, by):
+            s_i = bx if replicate_h == 1 else (bx // replicate_h)
+            group_i = by
+            h0 = 0 if replicate_h == 1 else (bx % replicate_h) * 64
+
+            q_tile0 = T.alloc_shared([h_per_block, group_size], FP8)
+            q_tile1 = T.alloc_shared([h_per_block, group_size], FP8)
+            q_tile2 = T.alloc_shared([h_per_block, group_size], FP8)
+            q_tile3 = T.alloc_shared([h_per_block, group_size], FP8)
+            kv_tile0 = T.alloc_shared([BI, group_size], FP8)
+            kv_tile1 = T.alloc_shared([BI, group_size], FP8)
+            kv_tile2 = T.alloc_shared([BI, group_size], FP8)
+            kv_tile3 = T.alloc_shared([BI, group_size], FP8)
+            q_tail_buf = T.alloc_shared([h_per_block, d_tail], FP8)
+            k_tail_shared = T.alloc_shared([BI, d_tail], FP8)
+            s_fp8_shared = T.alloc_shared([h_per_block, BI], FP8)
+            page_idx_shared = T.alloc_shared([BI], T.int32)
+
+            mask = T.alloc_fragment([BI], T.bool)
+            acc_s = T.alloc_fragment([h_per_block, BI], accum_dtype)
+            acc_tile = T.alloc_fragment([h_per_block, BI], accum_dtype)
+            sv_tile = T.alloc_fragment([h_per_block, group_size], accum_dtype)
+            s_scaled = T.alloc_fragment([h_per_block, BI], accum_dtype)
+            s_amax = T.alloc_fragment([h_per_block], accum_dtype)
+            s_inv_scale = T.alloc_fragment([h_per_block], accum_dtype)
+            s_scale = T.alloc_fragment([h_per_block], accum_dtype)
+            sumexp = T.alloc_fragment([h_per_block], accum_dtype)
+            sumexp_i = T.alloc_fragment([h_per_block], accum_dtype)
+            alpha = T.alloc_fragment([h_per_block], accum_dtype)
+            m_i = T.alloc_fragment([h_per_block], accum_dtype)
+            m_i_prev = T.alloc_fragment([h_per_block], accum_dtype)
+
+            acc_o_tile0 = T.alloc_fragment([h_per_block, group_size], accum_dtype)
+            acc_o_tile1 = T.alloc_fragment([h_per_block, group_size], accum_dtype)
+            acc_o_tile2 = T.alloc_fragment([h_per_block, group_size], accum_dtype)
+            acc_o_tile3 = T.alloc_fragment([h_per_block, group_size], accum_dtype)
+
+            for h_i, j in T.Parallel(h_per_block, group_size):
+                acc_o_tile0[h_i, j] = 0
+                acc_o_tile1[h_i, j] = 0
+                acc_o_tile2[h_i, j] = 0
+                acc_o_tile3[h_i, j] = 0
+            T.fill(sumexp, 0)
+            T.fill(m_i, -(2**30))
+
+            for hh, j in T.Parallel(h_per_block, d_tail):
+                h_idx = h0 + hh
+                if h_idx < num_heads:
+                    q_tail_buf[hh, j] = q_tail[s_i, h_idx, j]
+                else:
+                    q_tail_buf[hh, j] = T.Cast(FP8, 0.0)
+
+            for hh, j in T.Parallel(h_per_block, group_size):
+                h_idx = h0 + hh
+                if h_idx < num_heads:
+                    q_tile0[hh, j] = q_fp8_cast[s_i, h_idx, 0 * group_size + j]
+                    q_tile1[hh, j] = q_fp8_cast[s_i, h_idx, 1 * group_size + j]
+                    q_tile2[hh, j] = q_fp8_cast[s_i, h_idx, 2 * group_size + j]
+                    q_tile3[hh, j] = q_fp8_cast[s_i, h_idx, 3 * group_size + j]
+                else:
+                    q_tile0[hh, j] = T.Cast(FP8, 0.0)
+                    q_tile1[hh, j] = T.Cast(FP8, 0.0)
+                    q_tile2[hh, j] = T.Cast(FP8, 0.0)
+                    q_tile3[hh, j] = T.Cast(FP8, 0.0)
+
+            for k_i in T.serial(inner_iter):
+                topk_block_i = group_i * inner_iter + k_i
+
+                for bi_i in T.Parallel(BI):
+                    idx = indices[s_i, topk_block_i * BI + bi_i]
+                    valid = idx >= 0
+                    page_idx_shared[bi_i] = T.if_then_else(valid, idx, 0)
+                    mask[bi_i] = valid
+
+                for bi_i, j in T.Parallel(BI, group_size):
+                    page = page_idx_shared[bi_i]
+                    kv_tile0[bi_i, j] = kv_fp8[page, 0 * group_size + j]
+                    kv_tile1[bi_i, j] = kv_fp8[page, 1 * group_size + j]
+                    kv_tile2[bi_i, j] = kv_fp8[page, 2 * group_size + j]
+                    kv_tile3[bi_i, j] = kv_fp8[page, 3 * group_size + j]
+
+                for bi_i, j in T.Parallel(BI, d_tail):
+                    page = page_idx_shared[bi_i]
+                    k_tail_shared[bi_i, j] = kv_fp8[page, rope_offset_fp8 + j]
+
+                for h_i, bi_i in T.Parallel(h_per_block, BI):
+                    acc_s[h_i, bi_i] = T.if_then_else(
+                        mask[bi_i], 0, -T.infinity(acc_s.dtype)
+                    )
+
+                T.gemm(q_tile0, kv_tile0, acc_tile, transpose_B=True, clear_accum=True)
+                for h_i, bi_i in T.Parallel(h_per_block, BI):
+                    acc_s[h_i, bi_i] += acc_tile[h_i, bi_i]
+
+                T.gemm(q_tile1, kv_tile1, acc_tile, transpose_B=True, clear_accum=True)
+                for h_i, bi_i in T.Parallel(h_per_block, BI):
+                    acc_s[h_i, bi_i] += acc_tile[h_i, bi_i]
+
+                T.gemm(q_tile2, kv_tile2, acc_tile, transpose_B=True, clear_accum=True)
+                for h_i, bi_i in T.Parallel(h_per_block, BI):
+                    acc_s[h_i, bi_i] += acc_tile[h_i, bi_i]
+
+                T.gemm(q_tile3, kv_tile3, acc_tile, transpose_B=True, clear_accum=True)
+                for h_i, bi_i in T.Parallel(h_per_block, BI):
+                    acc_s[h_i, bi_i] += acc_tile[h_i, bi_i]
+
+                T.gemm(
+                    q_tail_buf,
+                    k_tail_shared,
+                    acc_s,
+                    transpose_B=True,
+                    policy=T.GemmWarpPolicy.FullCol,
+                )
+
+                T.copy(m_i, m_i_prev)
+                T.reduce_max(acc_s, m_i, dim=1, clear=False)
+                for h_i in T.Parallel(h_per_block):
+                    alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
+                for h_i, bi_i in T.Parallel(h_per_block, BI):
+                    acc_s[h_i, bi_i] = T.exp2(
+                        acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale
+                    )
+                T.reduce_sum(acc_s, sumexp_i, dim=1)
+                for h_i in T.Parallel(h_per_block):
+                    sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
+                for h_i, j in T.Parallel(h_per_block, group_size):
+                    acc_o_tile0[h_i, j] = acc_o_tile0[h_i, j] * alpha[h_i]
+                    acc_o_tile1[h_i, j] = acc_o_tile1[h_i, j] * alpha[h_i]
+                    acc_o_tile2[h_i, j] = acc_o_tile2[h_i, j] * alpha[h_i]
+                    acc_o_tile3[h_i, j] = acc_o_tile3[h_i, j] * alpha[h_i]
+
+                for h_i, bi_i in T.Parallel(h_per_block, BI):
+                    s_scaled[h_i, bi_i] = acc_s[h_i, bi_i]
+                T.fill(s_amax, 0)
+                T.reduce_max(s_scaled, s_amax, dim=1, clear=False)
+                for h_i in T.Parallel(h_per_block):
+                    s_inv_scale[h_i] = fp8_max_val / T.max(s_amax[h_i], 1e-12)
+                    s_scale[h_i] = 1.0 / s_inv_scale[h_i]
+                for h_i, bi_i in T.Parallel(h_per_block, BI):
+                    s_fp8_shared[h_i, bi_i] = T.clamp(
+                        s_scaled[h_i, bi_i] * s_inv_scale[h_i],
+                        -fp8_max_val,
+                        fp8_max_val,
+                    )
+                T.gemm(s_fp8_shared, kv_tile0, sv_tile, clear_accum=True)
+                for h_i, j in T.Parallel(h_per_block, group_size):
+                    acc_o_tile0[h_i, j] = (
+                        acc_o_tile0[h_i, j] + sv_tile[h_i, j] * s_scale[h_i]
+                    )
+
+                for h_i, bi_i in T.Parallel(h_per_block, BI):
+                    s_scaled[h_i, bi_i] = acc_s[h_i, bi_i]
+                T.fill(s_amax, 0)
+                T.reduce_max(s_scaled, s_amax, dim=1, clear=False)
+                for h_i in T.Parallel(h_per_block):
+                    s_inv_scale[h_i] = fp8_max_val / T.max(s_amax[h_i], 1e-12)
+                    s_scale[h_i] = 1.0 / s_inv_scale[h_i]
+                for h_i, bi_i in T.Parallel(h_per_block, BI):
+                    s_fp8_shared[h_i, bi_i] = T.clamp(
+                        s_scaled[h_i, bi_i] * s_inv_scale[h_i],
+                        -fp8_max_val,
+                        fp8_max_val,
+                    )
+                T.gemm(s_fp8_shared, kv_tile1, sv_tile, clear_accum=True)
+                for h_i, j in T.Parallel(h_per_block, group_size):
+                    acc_o_tile1[h_i, j] = (
+                        acc_o_tile1[h_i, j] + sv_tile[h_i, j] * s_scale[h_i]
+                    )
+
+                for h_i, bi_i in T.Parallel(h_per_block, BI):
+                    s_scaled[h_i, bi_i] = acc_s[h_i, bi_i]
+                T.fill(s_amax, 0)
+                T.reduce_max(s_scaled, s_amax, dim=1, clear=False)
+                for h_i in T.Parallel(h_per_block):
+                    s_inv_scale[h_i] = fp8_max_val / T.max(s_amax[h_i], 1e-12)
+                    s_scale[h_i] = 1.0 / s_inv_scale[h_i]
+                for h_i, bi_i in T.Parallel(h_per_block, BI):
+                    s_fp8_shared[h_i, bi_i] = T.clamp(
+                        s_scaled[h_i, bi_i] * s_inv_scale[h_i],
+                        -fp8_max_val,
+                        fp8_max_val,
+                    )
+                T.gemm(s_fp8_shared, kv_tile2, sv_tile, clear_accum=True)
+                for h_i, j in T.Parallel(h_per_block, group_size):
+                    acc_o_tile2[h_i, j] = (
+                        acc_o_tile2[h_i, j] + sv_tile[h_i, j] * s_scale[h_i]
+                    )
+
+                for h_i, bi_i in T.Parallel(h_per_block, BI):
+                    s_scaled[h_i, bi_i] = acc_s[h_i, bi_i]
+                T.fill(s_amax, 0)
+                T.reduce_max(s_scaled, s_amax, dim=1, clear=False)
+                for h_i in T.Parallel(h_per_block):
+                    s_inv_scale[h_i] = fp8_max_val / T.max(s_amax[h_i], 1e-12)
+                    s_scale[h_i] = 1.0 / s_inv_scale[h_i]
+                for h_i, bi_i in T.Parallel(h_per_block, BI):
+                    s_fp8_shared[h_i, bi_i] = T.clamp(
+                        s_scaled[h_i, bi_i] * s_inv_scale[h_i],
+                        -fp8_max_val,
+                        fp8_max_val,
+                    )
+                T.gemm(s_fp8_shared, kv_tile3, sv_tile, clear_accum=True)
+                for h_i, j in T.Parallel(h_per_block, group_size):
+                    acc_o_tile3[h_i, j] = (
+                        acc_o_tile3[h_i, j] + sv_tile[h_i, j] * s_scale[h_i]
+                    )
+
+            for h_i, j in T.Parallel(h_per_block, group_size):
+                denom = T.if_then_else(sumexp[h_i] == 0.0, 1.0, sumexp[h_i])
+                acc_o_tile0[h_i, j] = acc_o_tile0[h_i, j] / denom
+                acc_o_tile1[h_i, j] = acc_o_tile1[h_i, j] / denom
+                acc_o_tile2[h_i, j] = acc_o_tile2[h_i, j] / denom
+                acc_o_tile3[h_i, j] = acc_o_tile3[h_i, j] / denom
+
+            for h_i in T.Parallel(h_per_block):
+                sumexp[h_i] = T.if_then_else(
+                    sumexp[h_i] == 0.0,
+                    -(2**30),
+                    T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale,
+                )
+
+            for h_i, j in T.Parallel(h_per_block, group_size):
+                h_idx = h0 + h_i
+                if h_idx < num_heads:
+                    partial_o[s_i, group_i, h_idx, 0 * group_size + j] = acc_o_tile0[
+                        h_i, j
+                    ]
+                    partial_o[s_i, group_i, h_idx, 1 * group_size + j] = acc_o_tile1[
+                        h_i, j
+                    ]
+                    partial_o[s_i, group_i, h_idx, 2 * group_size + j] = acc_o_tile2[
+                        h_i, j
+                    ]
+                    partial_o[s_i, group_i, h_idx, 3 * group_size + j] = acc_o_tile3[
+                        h_i, j
+                    ]
+
+            for h_i in T.Parallel(h_per_block):
+                h_idx = h0 + h_i
+                if h_idx < num_heads:
+                    partial_lse[s_i, group_i, h_idx] = sumexp[h_i]
+
+    return main
+
+
+def fp8_quant_kv_cache_separate(
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """HIP tilelang FP8 KV layout: nope(512 fp8) + rope(64 fp8)."""
+    k_nope_2d = k_nope.squeeze(1) if k_nope.ndim == 3 else k_nope
+    k_rope_2d = k_rope.squeeze(1) if k_rope.ndim == 3 else k_rope
+
+    dim_nope = k_nope_2d.shape[1]
+    dim_rope = k_rope_2d.shape[1]
+    assert dim_nope == 512, f"Expected dim_nope=512, got {dim_nope}"
+    assert dim_rope == 64, f"Expected dim_rope=64, got {dim_rope}"
+
+    fp8_dtype = torch.float8_e4m3fnuz if _is_fp8_fnuz else torch.float8_e4m3fn
+    nope_part_u8 = k_nope_2d.contiguous().to(fp8_dtype).view(torch.uint8)
+    rope_part_u8 = k_rope_2d.contiguous().to(fp8_dtype).view(torch.uint8)
+    return nope_part_u8.unsqueeze(1), rope_part_u8.unsqueeze(1)
+
+
 def tilelang_sparse_fwd(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -1050,6 +1370,69 @@ def tilelang_sparse_fwd(
     tail_dim = dim - d_v
     topk = indices.shape[-1]
     assert topk == 2048
+
+    is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+
+    if _is_hip and is_fp8_kv:
+        # HIP FP8 KV path: no-scale KV layout (nope 512 fp8 + rope 64 fp8), 2-stage only.
+        assert (
+            kv.shape[-1] == dim
+        ), f"Expected FP8 KV dim == q dim ({dim}), got {kv.shape[-1]}"
+
+        if _is_gfx95_supported:
+            block_I, threads = 64, 256
+            block_per_cu = 3
+            CU = 256
+        else:
+            block_I, threads = 32, 128
+            block_per_cu = 1
+            CU = 304
+
+        NI = topk // block_I
+
+        def _inner_iter_fp8(seq: int) -> int:
+            max_it = int(seq * NI / (CU * block_per_cu))
+            it = NI
+            while it >= 2:
+                if it <= max_it and NI % it == 0:
+                    return it
+                it //= 2
+            return 1
+
+        inner_iter = _inner_iter_fp8(q.shape[0])
+        n_groups = NI // inner_iter
+        fp8_dtype = torch.float8_e4m3fnuz if _is_fp8_fnuz else torch.float8_e4m3fn
+        q_fp8_all = q.to(fp8_dtype)
+        q_fp8 = q_fp8_all[:, :, :d_v].contiguous()
+        q_tail_fp8 = q_fp8_all[:, :, d_v:].contiguous()
+
+        kernel_partial = sparse_mla_fwd_decode_partial_fp8_wo_scale_2stage(
+            num_heads,
+            d_v,
+            tail_dim,
+            topk,
+            sm_scale=sm_scale,
+            block_I=block_I,
+            inner_iter=inner_iter,
+            threads=threads,
+            group_size=128,
+        )
+        kernel_combine = sparse_mla_fwd_decode_combine(
+            num_heads,
+            d_v,
+            n_groups * block_I,
+            head_per_block=4,
+            block_I=block_I,
+            threads=threads,
+        )
+        partial_o, partial_lse = kernel_partial(
+            q_fp8,
+            q_tail_fp8,
+            kv,
+            indices.view(q.shape[0], -1),
+        )
+        out = kernel_combine(partial_o.unsqueeze(0), partial_lse.unsqueeze(0))[0]
+        return out.unsqueeze(0)
 
     if _is_hip:
         # sparse_mla_fwd_decode_partial splits topk KV blocks into N_GROUPS

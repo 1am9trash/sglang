@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllo
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
+    is_hip,
     is_npu,
 )
 
@@ -66,6 +67,7 @@ MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+_is_hip = is_hip()
 
 
 class ModelRunnerKVCacheMixin:
@@ -257,13 +259,16 @@ class ModelRunnerKVCacheMixin:
 
         quant_block_size = NSATokenToKVPool.quant_block_size
         rope_storage_dtype = NSATokenToKVPool.rope_storage_dtype
-        # Calculate override_kv_cache_dim for FP8 storage for non-trtllm attention backends:
-        # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
-        # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
-        if kv_cache_dtype == torch.float8_e4m3fn:
+        # Calculate override_kv_cache_dim for FP8 storage for non-trtllm attention backends.
+        # For HIP tilelang FP8 path, keep raw FP8 MLA layout: nope(512 fp8) + rope(64 fp8).
+        # i.e. kv_cache_dim = kv_lora_rank + qk_rope_head_dim.
+        if kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
             assert (
                 kv_lora_rank % quant_block_size == 0
             ), f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
+
+            if _is_hip:
+                return kv_cache_dim
 
             return (
                 kv_lora_rank

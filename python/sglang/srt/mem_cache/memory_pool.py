@@ -1574,16 +1574,25 @@ class MLATokenToKVPool(KVCache):
         layer_id = layer.layer_id
 
         if self.nsa_kv_cache_store_fp8:
-            # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
-            # This also enables reuse of set_mla_kv_buffer_triton two-tensor write path
-            # quantize_k_cache_separate returns (nope_part, rope_part) as uint8 bytes
-            cache_k_nope_fp8, cache_k_rope_fp8 = quantize_k_cache_separate(
-                cache_k_nope, cache_k_rope
-            )
+            # HIP tilelang FP8 path uses no-scale KV layout:
+            #   nope(512 fp8 bytes) + rope(64 fp8 bytes) => dim 576.
+            if _is_hip:
+                from sglang.srt.layers.attention.nsa.tilelang_kernel import (
+                    fp8_quant_kv_cache_separate,
+                )
 
-            # Reuse existing two-tensor write kernel (works with FP8 byte layout)
-            # cache_k_nope_fp8: (num_tokens, 1, 528) uint8 [nope_fp8(512) | scales(16)]
-            # cache_k_rope_fp8: (num_tokens, 1, 128) uint8 [rope_bf16_bytes(128)]
+                cache_k_nope_fp8, cache_k_rope_fp8 = fp8_quant_kv_cache_separate(
+                    cache_k_nope, cache_k_rope
+                )
+            else:
+                # Legacy packed layout for non-HIP paths.
+                cache_k_nope_fp8, cache_k_rope_fp8 = quantize_k_cache_separate(
+                    cache_k_nope, cache_k_rope
+                )
+
+            # Reuse existing two-tensor write kernel for both layouts:
+            # - HIP no-scale: nope_fp8(512) + rope_fp8(64)
+            # - non-HIP packed: nope_fp8+scales + rope_bf16_bytes
             set_mla_kv_buffer_triton(
                 self.kv_buffer[layer_id - self.start_layer],
                 loc,
