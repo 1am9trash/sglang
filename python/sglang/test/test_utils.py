@@ -37,6 +37,7 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device,
+    is_blackwell,
     is_cuda,
     is_xpu,
     kill_process_tree,
@@ -197,8 +198,8 @@ def is_in_amd_ci():
 
 
 def is_blackwell_system():
-    """Return whether it is running on a Blackwell (B200) system."""
-    return envs.IS_BLACKWELL.get()
+    """Same CUDA capability + toolkit semantics as ``sglang.srt.utils.is_blackwell``."""
+    return is_blackwell()
 
 
 def is_h200_system():
@@ -865,7 +866,6 @@ def popen_launch_server(
         Started subprocess.Popen object
     """
     other_args = other_args or []
-    offline_force_disabled = env.get("HF_HUB_OFFLINE") == "0"
 
     # Auto-detect device if needed
     if device == "auto":
@@ -886,7 +886,7 @@ def popen_launch_server(
     try:
         from sglang.utils import is_in_ci
 
-        if is_in_ci() and not offline_force_disabled:
+        if is_in_ci():
             per_run_marker_path = _try_enable_offline_mode_if_cache_complete(
                 model, env, other_args
             )
