@@ -52,7 +52,6 @@ from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
     maybe_init_custom_mem_pool,
     set_mla_kv_buffer_triton,
-    set_mla_kv_buffer_triton_fp8_quant,
     set_mla_kv_scale_buffer_triton,
 )
 from sglang.srt.utils import (
@@ -1578,35 +1577,30 @@ class MLATokenToKVPool(KVCache):
 
         if self.nsa_kv_cache_store_fp8:
             if _is_hip:
-                # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
-                # Fuse BF16/FP16 -> FP8 cast with paged KV write.
+                # HIP FP8 path: cast directly to KV dtype, then write.
                 fp8_dtype = (
                     torch.float8_e4m3fnuz if _is_fp8_fnuz else torch.float8_e4m3fn
                 )
-                set_mla_kv_buffer_triton_fp8_quant(
-                    self.kv_buffer[layer_id - self.start_layer],
-                    loc,
-                    cache_k_nope,
-                    cache_k_rope,
-                    fp8_dtype,
-                )
+                if cache_k_nope.dtype != fp8_dtype:
+                    cache_k_nope = cache_k_nope.to(self.dtype)
+                    cache_k_rope = cache_k_rope.to(self.dtype)
             else:
                 # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
                 # This also enables reuse of set_mla_kv_buffer_triton two-tensor write path
                 # quantize_k_cache_separate returns (nope_part, rope_part) as uint8 bytes
+                # cache_k_nope_fp8: (num_tokens, 1, 528) uint8 [nope_fp8(512) | scales(16)]
+                # cache_k_rope_fp8: (num_tokens, 1, 128) uint8 [rope_bf16_bytes(128)]
                 cache_k_nope_fp8, cache_k_rope_fp8 = quantize_k_cache_separate(
                     cache_k_nope, cache_k_rope
                 )
 
-                # Reuse existing two-tensor write kernel (works with FP8 byte layout)
-                # cache_k_nope_fp8: (num_tokens, 1, 528) uint8 [nope_fp8(512) | scales(16)]
-                # cache_k_rope_fp8: (num_tokens, 1, 128) uint8 [rope_bf16_bytes(128)]
-                set_mla_kv_buffer_triton(
-                    self.kv_buffer[layer_id - self.start_layer],
-                    loc,
-                    cache_k_nope_fp8,
-                    cache_k_rope_fp8,
-                )
+            # Reuse existing two-tensor write kernel (works with FP8 byte layout)
+            set_mla_kv_buffer_triton(
+                self.kv_buffer[layer_id - self.start_layer],
+                loc,
+                cache_k_nope_fp8,
+                cache_k_rope_fp8,
+            )
         else:
             if cache_k_nope.dtype != self.dtype:
                 cache_k_nope = cache_k_nope.to(self.dtype)
