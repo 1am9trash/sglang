@@ -1072,8 +1072,12 @@ def sparse_mla_fwd_decode_partial_fp8(
         sm_scale = sm_scale * 1.44269504
 
     h_per_block = 16
-    assert num_heads % h_per_block == 0, "num_heads must be divisible by 16"
-    head_blocks_per_seq = num_heads // h_per_block
+    # Match bf16 partial behavior: keep fixed 16-head tiles and use
+    # sliced T.copy on H0:H1 for tail handling.
+    assert (
+        num_heads <= h_per_block or num_heads % h_per_block == 0
+    ), "num_heads must be <=16 or divisible by 16"
+    head_blocks_per_seq = (num_heads + h_per_block - 1) // h_per_block
 
     seq_len = T.symbolic("seq_len")
     num_pages = T.symbolic("num_pages")
@@ -1101,7 +1105,8 @@ def sparse_mla_fwd_decode_partial_fp8(
         ):
             s_i = bx // head_blocks_per_seq
             group_i = by
-            h0 = (bx % head_blocks_per_seq) * h_per_block
+            H0 = (bx % head_blocks_per_seq) * h_per_block
+            H1 = H0 + h_per_block
 
             q_tile0 = T.alloc_shared([h_per_block, group_size], fp8_dtype)
             q_tile1 = T.alloc_shared([h_per_block, group_size], fp8_dtype)
@@ -1139,13 +1144,11 @@ def sparse_mla_fwd_decode_partial_fp8(
             T.fill(sumexp, 0)
             T.fill(m_i, -(2**30))
 
-            h1 = h0 + h_per_block
-            T.copy(q_fp8[s_i, h0:h1, d_v:], q_tail_buf)
-            for hh, j in T.Parallel(h_per_block, group_size):
-                q_tile0[hh, j] = q_fp8[s_i, h0 + hh, 0 * group_size + j]
-                q_tile1[hh, j] = q_fp8[s_i, h0 + hh, 1 * group_size + j]
-                q_tile2[hh, j] = q_fp8[s_i, h0 + hh, 2 * group_size + j]
-                q_tile3[hh, j] = q_fp8[s_i, h0 + hh, 3 * group_size + j]
+            T.copy(q_fp8[s_i, H0:H1, d_v:], q_tail_buf)
+            T.copy(q_fp8[s_i, H0:H1, 0 * group_size : 1 * group_size], q_tile0)
+            T.copy(q_fp8[s_i, H0:H1, 1 * group_size : 2 * group_size], q_tile1)
+            T.copy(q_fp8[s_i, H0:H1, 2 * group_size : 3 * group_size], q_tile2)
+            T.copy(q_fp8[s_i, H0:H1, 3 * group_size : 4 * group_size], q_tile3)
 
             for k_i in T.serial(inner_iter):
                 topk_block_i = group_i * inner_iter + k_i
@@ -1253,22 +1256,24 @@ def sparse_mla_fwd_decode_partial_fp8(
                     T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale,
                 )
 
-            for h_i, j in T.Parallel(h_per_block, group_size):
-                partial_o[s_i, group_i, h0 + h_i, 0 * group_size + j] = acc_o_tile0[
-                    h_i, j
-                ]
-                partial_o[s_i, group_i, h0 + h_i, 1 * group_size + j] = acc_o_tile1[
-                    h_i, j
-                ]
-                partial_o[s_i, group_i, h0 + h_i, 2 * group_size + j] = acc_o_tile2[
-                    h_i, j
-                ]
-                partial_o[s_i, group_i, h0 + h_i, 3 * group_size + j] = acc_o_tile3[
-                    h_i, j
-                ]
+            T.copy(
+                acc_o_tile0,
+                partial_o[s_i, group_i, H0:H1, 0 * group_size : 1 * group_size],
+            )
+            T.copy(
+                acc_o_tile1,
+                partial_o[s_i, group_i, H0:H1, 1 * group_size : 2 * group_size],
+            )
+            T.copy(
+                acc_o_tile2,
+                partial_o[s_i, group_i, H0:H1, 2 * group_size : 3 * group_size],
+            )
+            T.copy(
+                acc_o_tile3,
+                partial_o[s_i, group_i, H0:H1, 3 * group_size : 4 * group_size],
+            )
 
-            for h_i in T.Parallel(h_per_block):
-                partial_lse[s_i, group_i, h0 + h_i] = sumexp[h_i]
+            T.copy(sumexp, partial_lse[s_i, group_i, H0:H1])
 
     return main
 
