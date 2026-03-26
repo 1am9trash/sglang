@@ -46,11 +46,13 @@ from sglang.srt.layers.attention.nsa.quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
 )
+from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
     maybe_init_custom_mem_pool,
     set_mla_kv_buffer_triton,
+    set_mla_kv_buffer_triton_fp8_quant,
     set_mla_kv_scale_buffer_triton,
 )
 from sglang.srt.utils import (
@@ -82,6 +84,7 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
+_is_fp8_fnuz = is_fp8_fnuz()
 
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
@@ -1577,28 +1580,29 @@ class MLATokenToKVPool(KVCache):
             # HIP tilelang FP8 path uses no-scale KV layout:
             #   nope(512 fp8 bytes) + rope(64 fp8 bytes) => dim 576.
             if _is_hip:
-                from sglang.srt.layers.attention.nsa.tilelang_kernel import (
-                    fp8_quant_kv_cache_separate,
+                fp8_dtype = (
+                    torch.float8_e4m3fnuz if _is_fp8_fnuz else torch.float8_e4m3fn
                 )
-
-                cache_k_nope_fp8, cache_k_rope_fp8 = fp8_quant_kv_cache_separate(
-                    cache_k_nope, cache_k_rope
+                set_mla_kv_buffer_triton_fp8_quant(
+                    self.kv_buffer[layer_id - self.start_layer],
+                    loc,
+                    cache_k_nope,
+                    cache_k_rope,
+                    fp8_dtype,
                 )
             else:
                 # Legacy packed layout for non-HIP paths.
                 cache_k_nope_fp8, cache_k_rope_fp8 = quantize_k_cache_separate(
                     cache_k_nope, cache_k_rope
                 )
-
-            # Reuse existing two-tensor write kernel for both layouts:
-            # - HIP no-scale: nope_fp8(512) + rope_fp8(64)
-            # - non-HIP packed: nope_fp8+scales + rope_bf16_bytes
-            set_mla_kv_buffer_triton(
-                self.kv_buffer[layer_id - self.start_layer],
-                loc,
-                cache_k_nope_fp8,
-                cache_k_rope_fp8,
-            )
+                # Reuse existing two-tensor write kernel for non-HIP layout:
+                # nope_fp8+scales + rope_bf16_bytes.
+                set_mla_kv_buffer_triton(
+                    self.kv_buffer[layer_id - self.start_layer],
+                    loc,
+                    cache_k_nope_fp8,
+                    cache_k_rope_fp8,
+                )
         else:
             if cache_k_nope.dtype != self.dtype:
                 cache_k_nope = cache_k_nope.to(self.dtype)

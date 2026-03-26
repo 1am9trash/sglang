@@ -24,7 +24,8 @@ _is_gfx95_supported = is_gfx95_supported()
 _is_fp8_fnuz = is_fp8_fnuz()
 
 BF16 = "bfloat16"
-FP8 = "float8_e4m3fnuz" if _is_fp8_fnuz else "float8_e4m3"
+# TileLang MFMA expects explicit FP8 variants (fn/fnuz), not bare float8_e4m3.
+FP8 = "float8_e4m3fnuz" if _is_fp8_fnuz else "float8_e4m3fn"
 FP32 = "float32"
 
 
@@ -1066,16 +1067,14 @@ def sparse_mla_fwd_decode_partial_fp8_wo_scale_2stage(
     else:
         sm_scale = sm_scale * 1.44269504
 
-    head_kv = num_heads
-    padded_h = max(tilelang.math.next_power_of_2(head_kv), 16)
-    replicate_h = (head_kv // 64) if head_kv > 64 else 1
-    h_per_block = padded_h if replicate_h == 1 else 64
+    h_per_block = 16
+    assert num_heads % h_per_block == 0, "num_heads must be divisible by 16"
+    head_blocks_per_seq = num_heads // h_per_block
 
     seq_len = T.symbolic("seq_len")
     num_pages = T.symbolic("num_pages")
 
-    q_fp8_shape = [seq_len, num_heads, d_v]
-    q_tail_shape = [seq_len, num_heads, d_tail]
+    q_fp8_shape = [seq_len, num_heads, d_v + d_tail]
     kv_fp8_shape = [num_pages, dim_quant_fp8]
     idx_shape = [seq_len, topk]
     partial_o_shape = [seq_len, n_groups, num_heads, d_v]
@@ -1086,17 +1085,19 @@ def sparse_mla_fwd_decode_partial_fp8_wo_scale_2stage(
 
     @T.prim_func
     def main(
-        q_fp8_cast: T.Tensor(q_fp8_shape, FP8),
-        q_tail: T.Tensor(q_tail_shape, FP8),
+        q_fp8: T.Tensor(q_fp8_shape, FP8),
         kv_fp8: T.Tensor(kv_fp8_shape, FP8),
         indices: T.Tensor(idx_shape, T.int32),
         partial_o: T.Tensor(partial_o_shape, dtype_bf16),
         partial_lse: T.Tensor(partial_lse_shape, accum_dtype),
     ):
-        with T.Kernel(seq_len * replicate_h, n_groups, threads=threads) as (bx, by):
-            s_i = bx if replicate_h == 1 else (bx // replicate_h)
+        with T.Kernel(seq_len * head_blocks_per_seq, n_groups, threads=threads) as (
+            bx,
+            by,
+        ):
+            s_i = bx // head_blocks_per_seq
             group_i = by
-            h0 = 0 if replicate_h == 1 else (bx % replicate_h) * 64
+            h0 = (bx % head_blocks_per_seq) * h_per_block
 
             q_tile0 = T.alloc_shared([h_per_block, group_size], FP8)
             q_tile1 = T.alloc_shared([h_per_block, group_size], FP8)
@@ -1139,24 +1140,13 @@ def sparse_mla_fwd_decode_partial_fp8_wo_scale_2stage(
             T.fill(m_i, -(2**30))
 
             for hh, j in T.Parallel(h_per_block, d_tail):
-                h_idx = h0 + hh
-                if h_idx < num_heads:
-                    q_tail_buf[hh, j] = q_tail[s_i, h_idx, j]
-                else:
-                    q_tail_buf[hh, j] = T.Cast(FP8, 0.0)
+                q_tail_buf[hh, j] = q_fp8[s_i, h0 + hh, d_v + j]
 
             for hh, j in T.Parallel(h_per_block, group_size):
-                h_idx = h0 + hh
-                if h_idx < num_heads:
-                    q_tile0[hh, j] = q_fp8_cast[s_i, h_idx, 0 * group_size + j]
-                    q_tile1[hh, j] = q_fp8_cast[s_i, h_idx, 1 * group_size + j]
-                    q_tile2[hh, j] = q_fp8_cast[s_i, h_idx, 2 * group_size + j]
-                    q_tile3[hh, j] = q_fp8_cast[s_i, h_idx, 3 * group_size + j]
-                else:
-                    q_tile0[hh, j] = T.Cast(FP8, 0.0)
-                    q_tile1[hh, j] = T.Cast(FP8, 0.0)
-                    q_tile2[hh, j] = T.Cast(FP8, 0.0)
-                    q_tile3[hh, j] = T.Cast(FP8, 0.0)
+                q_tile0[hh, j] = q_fp8[s_i, h0 + hh, 0 * group_size + j]
+                q_tile1[hh, j] = q_fp8[s_i, h0 + hh, 1 * group_size + j]
+                q_tile2[hh, j] = q_fp8[s_i, h0 + hh, 2 * group_size + j]
+                q_tile3[hh, j] = q_fp8[s_i, h0 + hh, 3 * group_size + j]
 
             for k_i in T.serial(inner_iter):
                 topk_block_i = group_i * inner_iter + k_i
@@ -1315,25 +1305,21 @@ def sparse_mla_fwd_decode_partial_fp8_wo_scale_2stage(
                 )
 
             for h_i, j in T.Parallel(h_per_block, group_size):
-                h_idx = h0 + h_i
-                if h_idx < num_heads:
-                    partial_o[s_i, group_i, h_idx, 0 * group_size + j] = acc_o_tile0[
-                        h_i, j
-                    ]
-                    partial_o[s_i, group_i, h_idx, 1 * group_size + j] = acc_o_tile1[
-                        h_i, j
-                    ]
-                    partial_o[s_i, group_i, h_idx, 2 * group_size + j] = acc_o_tile2[
-                        h_i, j
-                    ]
-                    partial_o[s_i, group_i, h_idx, 3 * group_size + j] = acc_o_tile3[
-                        h_i, j
-                    ]
+                partial_o[s_i, group_i, h0 + h_i, 0 * group_size + j] = acc_o_tile0[
+                    h_i, j
+                ]
+                partial_o[s_i, group_i, h0 + h_i, 1 * group_size + j] = acc_o_tile1[
+                    h_i, j
+                ]
+                partial_o[s_i, group_i, h0 + h_i, 2 * group_size + j] = acc_o_tile2[
+                    h_i, j
+                ]
+                partial_o[s_i, group_i, h0 + h_i, 3 * group_size + j] = acc_o_tile3[
+                    h_i, j
+                ]
 
             for h_i in T.Parallel(h_per_block):
-                h_idx = h0 + h_i
-                if h_idx < num_heads:
-                    partial_lse[s_i, group_i, h_idx] = sumexp[h_i]
+                partial_lse[s_i, group_i, h0 + h_i] = sumexp[h_i]
 
     return main
 
@@ -1364,7 +1350,8 @@ def tilelang_sparse_fwd(
     sm_scale: float,
     d_v: int = 512,
 ) -> torch.Tensor:
-    assert q.dim() == 3 and kv.dim() == 3 and indices.dim() == 3
+    assert q.dim() == 3 and indices.dim() == 3
+    assert kv.dim() in (2, 3), f"Expected kv dim in (2, 3), got {kv.dim()}"
     num_heads = q.shape[1]
     dim = q.shape[2]
     tail_dim = dim - d_v
@@ -1375,9 +1362,17 @@ def tilelang_sparse_fwd(
 
     if _is_hip and is_fp8_kv:
         # HIP FP8 KV path: no-scale KV layout (nope 512 fp8 + rope 64 fp8), 2-stage only.
+        if kv.dim() == 3:
+            assert (
+                kv.shape[1] == 1
+            ), f"Expected FP8 KV middle dim == 1, got {kv.shape[1]}"
+            kv_fp8 = kv.squeeze(1)
+        else:
+            kv_fp8 = kv
+
         assert (
-            kv.shape[-1] == dim
-        ), f"Expected FP8 KV dim == q dim ({dim}), got {kv.shape[-1]}"
+            kv_fp8.shape[-1] == dim
+        ), f"Expected FP8 KV dim == q dim ({dim}), got {kv_fp8.shape[-1]}"
 
         if _is_gfx95_supported:
             block_I, threads = 64, 256
@@ -1402,9 +1397,7 @@ def tilelang_sparse_fwd(
         inner_iter = _inner_iter_fp8(q.shape[0])
         n_groups = NI // inner_iter
         fp8_dtype = torch.float8_e4m3fnuz if _is_fp8_fnuz else torch.float8_e4m3fn
-        q_fp8_all = q.to(fp8_dtype)
-        q_fp8 = q_fp8_all[:, :, :d_v].contiguous()
-        q_tail_fp8 = q_fp8_all[:, :, d_v:].contiguous()
+        q_fp8 = q.to(fp8_dtype).contiguous()
 
         kernel_partial = sparse_mla_fwd_decode_partial_fp8_wo_scale_2stage(
             num_heads,
@@ -1427,8 +1420,7 @@ def tilelang_sparse_fwd(
         )
         partial_o, partial_lse = kernel_partial(
             q_fp8,
-            q_tail_fp8,
-            kv,
+            kv_fp8,
             indices.view(q.shape[0], -1),
         )
         out = kernel_combine(partial_o.unsqueeze(0), partial_lse.unsqueeze(0))[0]
