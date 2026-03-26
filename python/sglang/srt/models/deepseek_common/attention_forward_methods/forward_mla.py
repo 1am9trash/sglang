@@ -355,7 +355,7 @@ class DeepseekMLAForwardMixin:
                 kv_cache_dtype = (
                     fp8_dtype if self.kv_cache_dtype == "fp8_e4m3" else q_nope_out.dtype
                 )
-                q, _, _, _ = fused_qk_rope_cat_and_cache_mla(
+                q_cat, _, k_pe_fused, _ = fused_qk_rope_cat_and_cache_mla(
                     q_nope_out,
                     q_pe,
                     k_nope,
@@ -371,14 +371,18 @@ class DeepseekMLAForwardMixin:
                     self.rotary_emb.is_neox_style,
                     q_out_dtype=kv_cache_dtype,
                 )
+                q_nope_fused = q_cat[..., : self.kv_lora_rank]
+                q_pe_fused = q_cat[..., self.kv_lora_rank :]
                 save_kv_cache = False
                 if llama_4_scaling is not None:
-                    q *= llama_4_scaling
+                    q_nope_fused *= llama_4_scaling
                 attn_output = self.attn_mqa(
-                    q,
+                    q_nope_fused,
                     None,
                     None,
                     forward_batch,
+                    q_rope=q_pe_fused,
+                    k_rope=k_pe_fused,
                     save_kv_cache=save_kv_cache,
                     **(
                         dict(topk_indices=topk_indices)
