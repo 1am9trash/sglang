@@ -1577,9 +1577,9 @@ class MLATokenToKVPool(KVCache):
         layer_id = layer.layer_id
 
         if self.nsa_kv_cache_store_fp8:
-            # HIP TileLang FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
-            # Fuse BF16/FP16 -> FP8 cast with paged KV write.
             if _is_hip:
+                # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
+                # Fuse BF16/FP16 -> FP8 cast with paged KV write.
                 fp8_dtype = (
                     torch.float8_e4m3fnuz if _is_fp8_fnuz else torch.float8_e4m3fn
                 )
