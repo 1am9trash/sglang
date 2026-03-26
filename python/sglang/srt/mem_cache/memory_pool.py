@@ -1577,8 +1577,8 @@ class MLATokenToKVPool(KVCache):
         layer_id = layer.layer_id
 
         if self.nsa_kv_cache_store_fp8:
-            # HIP tilelang FP8 path uses no-scale KV layout:
-            #   nope(512 fp8 bytes) + rope(64 fp8 bytes) => dim 576.
+            # HIP TileLang FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
+            # Fuse BF16/FP16 -> FP8 cast with paged KV write.
             if _is_hip:
                 fp8_dtype = (
                     torch.float8_e4m3fnuz if _is_fp8_fnuz else torch.float8_e4m3fn
@@ -1591,12 +1591,16 @@ class MLATokenToKVPool(KVCache):
                     fp8_dtype,
                 )
             else:
-                # Legacy packed layout for non-HIP paths.
+                # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
+                # This also enables reuse of set_mla_kv_buffer_triton two-tensor write path
+                # quantize_k_cache_separate returns (nope_part, rope_part) as uint8 bytes
                 cache_k_nope_fp8, cache_k_rope_fp8 = quantize_k_cache_separate(
                     cache_k_nope, cache_k_rope
                 )
-                # Reuse existing two-tensor write kernel for non-HIP layout:
-                # nope_fp8+scales + rope_bf16_bytes.
+
+                # Reuse existing two-tensor write kernel (works with FP8 byte layout)
+                # cache_k_nope_fp8: (num_tokens, 1, 528) uint8 [nope_fp8(512) | scales(16)]
+                # cache_k_rope_fp8: (num_tokens, 1, 128) uint8 [rope_bf16_bytes(128)]
                 set_mla_kv_buffer_triton(
                     self.kv_buffer[layer_id - self.start_layer],
                     loc,
