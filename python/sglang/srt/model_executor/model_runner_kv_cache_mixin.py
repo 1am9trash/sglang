@@ -258,7 +258,7 @@ class ModelRunnerKVCacheMixin:
             return kv_cache_dim
 
         # On HIP with TileLang backend, keep the default MLA KV cache dimension.
-        # FP8 attention uses the raw nope(512 fp8)) + rope(64 fp8) layout, without extra per-block scales.
+        # FP8 attention uses the nope(512 fp8) + rope(64 fp8) layout, without extra per-block scales.
         if _is_hip and (
             self.server_args.nsa_prefill_backend == "tilelang"
             or self.server_args.nsa_decode_backend == "tilelang"
