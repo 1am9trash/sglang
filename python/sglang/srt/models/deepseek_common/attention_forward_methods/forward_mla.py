@@ -292,9 +292,18 @@ class DeepseekMLAForwardMixin:
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
+        skip_rope_for_nsa_tilelang_fused = (
+            _use_aiter_gfx95
+            and self.current_attention_backend == "nsa"
+            and (
+                get_global_server_args().nsa_decode_backend == "tilelang"
+                or get_global_server_args().nsa_prefill_backend == "tilelang"
+            )
+        )
         if (
             self.rotary_emb is not None
             and (not self._fuse_rope_for_trtllm_mla(forward_batch))
+            and (not skip_rope_for_nsa_tilelang_fused)
             and (not _use_aiter or not _is_gfx95_supported or self.use_nsa)
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
@@ -335,9 +344,11 @@ class DeepseekMLAForwardMixin:
             if (
                 _use_aiter_gfx95
                 and self.current_attention_backend == "nsa"
-                and get_global_server_args().nsa_decode_backend == "tilelang"
+                and (
+                    get_global_server_args().nsa_decode_backend == "tilelang"
+                    or get_global_server_args().nsa_prefill_backend == "tilelang"
+                )
                 and self.rotary_emb is not None
-                and forward_batch.forward_mode.is_decode_or_idle()
             ):
                 cos = self.rotary_emb.cos_cache
                 sin = self.rotary_emb.sin_cache
