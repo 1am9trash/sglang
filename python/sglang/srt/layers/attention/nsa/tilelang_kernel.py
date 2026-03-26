@@ -1,3 +1,4 @@
+from functools import lru_cache
 from typing import Optional, Tuple
 
 import tilelang
@@ -42,6 +43,18 @@ def fast_pow2(x):
 
 def fast_round_scale(amax, fp8_max_inv):
     return fast_pow2(fast_log2_ceil(amax * fp8_max_inv))
+
+
+@lru_cache(maxsize=8)
+def _pick_inner_iter(seq: int, ni: int, cu: int, block_per_cu: int) -> int:
+    """Largest inner_iter <= NI that keeps grid/CU >= block_per_cu."""
+    max_it = int(seq * ni / (cu * block_per_cu))
+    it = ni
+    while it >= 2:
+        if it <= max_it and ni % it == 0:
+            return it
+        it //= 2
+    return 1
 
 
 @tilelang.jit(pass_configs=pass_configs)
@@ -1061,7 +1074,6 @@ def sparse_mla_fwd_decode_partial_fp8(
 
     BI = block_I
     group_size = 128
-    num_tiles = d_v // group_size
     dim_quant_fp8 = d_v + d_tail
     rope_offset_fp8 = d_v
     n_groups = topk // (BI * inner_iter)
@@ -1079,14 +1091,16 @@ def sparse_mla_fwd_decode_partial_fp8(
     ), "num_heads must be <=16 or divisible by 16"
     head_blocks_per_seq = (num_heads + h_per_block - 1) // h_per_block
 
+    batch = 1
+    kv_group = 1
     seq_len = T.symbolic("seq_len")
     num_pages = T.symbolic("num_pages")
 
-    q_fp8_shape = [seq_len, num_heads, d_v + d_tail]
-    kv_fp8_shape = [num_pages, dim_quant_fp8]
-    idx_shape = [seq_len, topk]
-    partial_o_shape = [seq_len, n_groups, num_heads, d_v]
-    partial_lse_shape = [seq_len, n_groups, num_heads]
+    q_fp8_shape = [batch, seq_len, num_heads, d_v + d_tail]
+    kv_fp8_shape = [batch, num_pages, kv_group, dim_quant_fp8]
+    idx_shape = [batch, seq_len, kv_group, topk]
+    partial_o_shape = [batch, seq_len, n_groups, num_heads, d_v]
+    partial_lse_shape = [batch, seq_len, n_groups, num_heads]
 
     accum_dtype = T.float32
     dtype_bf16 = T.bfloat16
@@ -1103,6 +1117,7 @@ def sparse_mla_fwd_decode_partial_fp8(
             bx,
             by,
         ):
+            b_i, g_i = 0, 0
             s_i = bx // head_blocks_per_seq
             group_i = by
             H0 = (bx % head_blocks_per_seq) * h_per_block
@@ -1144,31 +1159,31 @@ def sparse_mla_fwd_decode_partial_fp8(
             T.fill(sumexp, 0)
             T.fill(m_i, -(2**30))
 
-            T.copy(q_fp8[s_i, H0:H1, d_v:], q_tail_buf)
-            T.copy(q_fp8[s_i, H0:H1, 0 * group_size : 1 * group_size], q_tile0)
-            T.copy(q_fp8[s_i, H0:H1, 1 * group_size : 2 * group_size], q_tile1)
-            T.copy(q_fp8[s_i, H0:H1, 2 * group_size : 3 * group_size], q_tile2)
-            T.copy(q_fp8[s_i, H0:H1, 3 * group_size : 4 * group_size], q_tile3)
+            T.copy(q_fp8[b_i, s_i, H0:H1, d_v:], q_tail_buf)
+            T.copy(q_fp8[b_i, s_i, H0:H1, 0 * group_size : 1 * group_size], q_tile0)
+            T.copy(q_fp8[b_i, s_i, H0:H1, 1 * group_size : 2 * group_size], q_tile1)
+            T.copy(q_fp8[b_i, s_i, H0:H1, 2 * group_size : 3 * group_size], q_tile2)
+            T.copy(q_fp8[b_i, s_i, H0:H1, 3 * group_size : 4 * group_size], q_tile3)
 
             for k_i in T.serial(inner_iter):
                 topk_block_i = group_i * inner_iter + k_i
 
                 for bi_i in T.Parallel(BI):
-                    idx = indices[s_i, topk_block_i * BI + bi_i]
+                    idx = indices[b_i, s_i, g_i, topk_block_i * BI + bi_i]
                     valid = idx >= 0
                     page_idx_shared[bi_i] = T.if_then_else(valid, idx, 0)
                     mask[bi_i] = valid
 
                 for bi_i, j in T.Parallel(BI, group_size):
                     page = page_idx_shared[bi_i]
-                    kv_tile0[bi_i, j] = kv_fp8[page, 0 * group_size + j]
-                    kv_tile1[bi_i, j] = kv_fp8[page, 1 * group_size + j]
-                    kv_tile2[bi_i, j] = kv_fp8[page, 2 * group_size + j]
-                    kv_tile3[bi_i, j] = kv_fp8[page, 3 * group_size + j]
+                    kv_tile0[bi_i, j] = kv_fp8[b_i, page, g_i, 0 * group_size + j]
+                    kv_tile1[bi_i, j] = kv_fp8[b_i, page, g_i, 1 * group_size + j]
+                    kv_tile2[bi_i, j] = kv_fp8[b_i, page, g_i, 2 * group_size + j]
+                    kv_tile3[bi_i, j] = kv_fp8[b_i, page, g_i, 3 * group_size + j]
 
                 for bi_i, j in T.Parallel(BI, d_tail):
                     page = page_idx_shared[bi_i]
-                    k_tail_shared[bi_i, j] = kv_fp8[page, rope_offset_fp8 + j]
+                    k_tail_shared[bi_i, j] = kv_fp8[b_i, page, g_i, rope_offset_fp8 + j]
 
                 for h_i, bi_i in T.Parallel(h_per_block, BI):
                     acc_s[h_i, bi_i] = T.if_then_else(
@@ -1258,22 +1273,22 @@ def sparse_mla_fwd_decode_partial_fp8(
 
             T.copy(
                 acc_o_tile0,
-                partial_o[s_i, group_i, H0:H1, 0 * group_size : 1 * group_size],
+                partial_o[b_i, s_i, group_i, H0:H1, 0 * group_size : 1 * group_size],
             )
             T.copy(
                 acc_o_tile1,
-                partial_o[s_i, group_i, H0:H1, 1 * group_size : 2 * group_size],
+                partial_o[b_i, s_i, group_i, H0:H1, 1 * group_size : 2 * group_size],
             )
             T.copy(
                 acc_o_tile2,
-                partial_o[s_i, group_i, H0:H1, 2 * group_size : 3 * group_size],
+                partial_o[b_i, s_i, group_i, H0:H1, 2 * group_size : 3 * group_size],
             )
             T.copy(
                 acc_o_tile3,
-                partial_o[s_i, group_i, H0:H1, 3 * group_size : 4 * group_size],
+                partial_o[b_i, s_i, group_i, H0:H1, 3 * group_size : 4 * group_size],
             )
 
-            T.copy(sumexp, partial_lse[s_i, group_i, H0:H1])
+            T.copy(sumexp, partial_lse[b_i, s_i, group_i, H0:H1])
 
     return main
 
@@ -1285,134 +1300,60 @@ def tilelang_sparse_fwd(
     sm_scale: float,
     d_v: int = 512,
 ) -> torch.Tensor:
-    assert q.dim() == 3 and indices.dim() == 3
-    assert kv.dim() in (2, 3), f"Expected kv dim in (2, 3), got {kv.dim()}"
     num_heads = q.shape[1]
     dim = q.shape[2]
     tail_dim = dim - d_v
     topk = indices.shape[-1]
     assert topk == 2048
 
-    is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-
-    if _is_hip and is_fp8_kv:
-        # HIP FP8 KV path: no-scale KV layout (nope 512 fp8 + rope 64 fp8), 2-stage only.
-        if kv.dim() == 3:
-            assert (
-                kv.shape[1] == 1
-            ), f"Expected FP8 KV middle dim == 1, got {kv.shape[1]}"
-            kv_fp8 = kv.squeeze(1)
-        else:
-            kv_fp8 = kv
-
-        assert (
-            kv_fp8.shape[-1] == dim
-        ), f"Expected FP8 KV dim == q dim ({dim}), got {kv_fp8.shape[-1]}"
-
-        if _is_gfx95_supported:
-            block_I, threads = 64, 256
-            block_per_cu = 3
-            CU = 256
-        else:
-            block_I, threads = 32, 128
-            block_per_cu = 1
-            CU = 304
-
-        NI = topk // block_I
-
-        def _inner_iter_fp8(seq: int) -> int:
-            max_it = int(seq * NI / (CU * block_per_cu))
-            it = NI
-            while it >= 2:
-                if it <= max_it and NI % it == 0:
-                    return it
-                it //= 2
-            return 1
-
-        inner_iter = _inner_iter_fp8(q.shape[0])
-        n_groups = NI // inner_iter
-        fp8_dtype = torch.float8_e4m3fnuz if _is_fp8_fnuz else torch.float8_e4m3fn
-        q_fp8 = q.to(fp8_dtype).contiguous()
-
-        kernel_partial = sparse_mla_fwd_decode_partial_fp8(
-            num_heads,
-            d_v,
-            tail_dim,
-            topk,
-            sm_scale=sm_scale,
-            block_I=block_I,
-            inner_iter=inner_iter,
-            threads=threads,
-        )
-        kernel_combine = sparse_mla_fwd_decode_combine(
-            num_heads,
-            d_v,
-            n_groups * block_I,
-            head_per_block=4,
-            block_I=block_I,
-            threads=threads,
-        )
-        partial_o, partial_lse = kernel_partial(
-            q_fp8,
-            kv_fp8,
-            indices.view(q.shape[0], -1),
-        )
-        out = kernel_combine(partial_o.unsqueeze(0), partial_lse.unsqueeze(0))[0]
-        return out.unsqueeze(0)
-
     if _is_hip:
-        # sparse_mla_fwd_decode_partial splits topk KV blocks into N_GROUPS
-        # independent tiles per query, then sparse_mla_fwd_decode_combine
-        # reduces them via online softmax.
-
-        if _is_gfx95_supported:
-            # gfx950
-            block_I, threads = 64, 256
-            block_per_cu = 2
+        is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+        if is_fp8_kv:
+            if q.dtype != kv.dtype:
+                q = q.to(kv.dtype)
+            if _is_gfx95_supported:
+                block_I, threads, block_per_cu, cu = 64, 256, 2, 256
+            else:
+                block_I, threads, block_per_cu, cu = 64, 256, 1, 304
+            ni = topk // block_I
+            inner_iter = _pick_inner_iter(q.shape[0], ni, cu, block_per_cu)
+            kernel_partial = sparse_mla_fwd_decode_partial_fp8(
+                num_heads,
+                d_v,
+                tail_dim,
+                topk,
+                sm_scale=sm_scale,
+                block_I=block_I,
+                inner_iter=inner_iter,
+                threads=threads,
+            )
         else:
-            # gfx942
-            block_I, threads = 32, 128
-            block_per_cu = 1
-
-        NI = topk // block_I
-        CU = 304
-
-        def _inner_iter(seq: int) -> int:
-            """Largest inner_iter ≤ NI that keeps grid/CU ≥ block_per_cu."""
-            max_it = int(seq * NI / (CU * block_per_cu))
-            it = NI
-            while it >= 2:
-                if it <= max_it and NI % it == 0:
-                    return it
-                it //= 2
-            return 1
-
-        inner_iter = _inner_iter(q.shape[0])
-        n_groups = NI // inner_iter
-
-        kernel_partial = sparse_mla_fwd_decode_partial(
-            num_heads,
-            d_v,
-            tail_dim,
-            topk,
-            sm_scale=sm_scale,
-            block_I=block_I,
-            inner_iter=inner_iter,
-            num_stages=1,
-            threads=threads,
-        )
-        kernel_combine = sparse_mla_fwd_decode_combine(
-            num_heads,
-            d_v,
-            n_groups * block_I,
-            head_per_block=4,
-            block_I=block_I,
-            threads=threads,
-        )
-        partial_o, partial_lse = kernel_partial(
+            block_I, threads, block_per_cu, cu = 32, 128, 1, 304
+            ni = topk // block_I
+            inner_iter = _pick_inner_iter(q.shape[0], ni, cu, block_per_cu)
+            kernel_partial = sparse_mla_fwd_decode_partial(
+                num_heads,
+                d_v,
+                tail_dim,
+                topk,
+                sm_scale=sm_scale,
+                block_I=block_I,
+                inner_iter=inner_iter,
+                threads=threads,
+            )
+        partial_o_batched, partial_lse_batched = kernel_partial(
             q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0)
         )
-        out = kernel_combine(partial_o, partial_lse)
+        n_groups = ni // inner_iter
+        kernel_combine = sparse_mla_fwd_decode_combine(
+            num_heads,
+            d_v,
+            n_groups * block_I,
+            head_per_block=4,
+            block_I=block_I,
+            threads=threads,
+        )
+        out = kernel_combine(partial_o_batched, partial_lse_batched)
     else:
         kernel = sparse_attention_fwd_kernel_v2(
             num_heads, d_v, tail_dim, topk, sm_scale=sm_scale
