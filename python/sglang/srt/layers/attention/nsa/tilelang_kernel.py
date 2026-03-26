@@ -1328,7 +1328,10 @@ def tilelang_sparse_fwd(
                 threads=threads,
             )
         else:
-            block_I, threads, block_per_cu, cu = 32, 128, 1, 304
+            if _is_gfx95_supported:
+                block_I, threads, block_per_cu, cu = 64, 256, 2, 256
+            else:
+                block_I, threads, block_per_cu, cu = 32, 128, 1, 304
             ni = topk // block_I
             inner_iter = _pick_inner_iter(q.shape[0], ni, cu, block_per_cu)
             kernel_partial = sparse_mla_fwd_decode_partial(
