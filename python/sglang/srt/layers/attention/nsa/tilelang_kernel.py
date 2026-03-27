@@ -1123,6 +1123,9 @@ def sparse_mla_fwd_decode_partial_fp8(
             H0 = (bx % head_blocks_per_seq) * h_per_block
             H1 = H0 + h_per_block
 
+            # We intentionally split the K=512 GEMM into 4x128 tiles.
+            # Although this adds extra intermediate memory traffic,
+            # it shortens the MFMA accumulation dependency chain and improves performance.
             q_tile0 = T.alloc_shared([h_per_block, group_size], fp8_dtype)
             q_tile1 = T.alloc_shared([h_per_block, group_size], fp8_dtype)
             q_tile2 = T.alloc_shared([h_per_block, group_size], fp8_dtype)
