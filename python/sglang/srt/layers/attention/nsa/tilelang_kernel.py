@@ -1303,6 +1303,7 @@ def tilelang_sparse_fwd(
     sm_scale: float,
     d_v: int = 512,
 ) -> torch.Tensor:
+    assert q.dim() == 3 and kv.dim() == 3 and indices.dim() == 3
     num_heads = q.shape[1]
     dim = q.shape[2]
     tail_dim = dim - d_v
