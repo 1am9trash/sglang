@@ -292,14 +292,7 @@ class DeepseekMLAForwardMixin:
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
-        skip_rope_for_nsa_tilelang_fused = (
-            _use_aiter_gfx95
-            and self.current_attention_backend == "nsa"
-            and (
-                get_global_server_args().nsa_decode_backend == "tilelang"
-                or get_global_server_args().nsa_prefill_backend == "tilelang"
-            )
-        )
+        skip_rope_for_nsa_tilelang_fused = self._skip_rope_for_nsa_tilelang_fused()
         if (
             self.rotary_emb is not None
             and (not self._fuse_rope_for_trtllm_mla(forward_batch))
@@ -341,15 +334,7 @@ class DeepseekMLAForwardMixin:
         save_kv_cache = True
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
-            if (
-                _use_aiter_gfx95
-                and self.current_attention_backend == "nsa"
-                and (
-                    get_global_server_args().nsa_decode_backend == "tilelang"
-                    or get_global_server_args().nsa_prefill_backend == "tilelang"
-                )
-                and self.rotary_emb is not None
-            ):
+            if self._skip_rope_for_nsa_tilelang_fused() and self.rotary_emb is not None:
                 cos = self.rotary_emb.cos_cache
                 sin = self.rotary_emb.sin_cache
                 kv_cache_dtype = (
@@ -593,4 +578,18 @@ class DeepseekMLAForwardMixin:
                 or forward_batch.forward_mode.is_target_verify()
             )
             and forward_batch.attn_backend.data_type == torch.float8_e4m3fn
+        )
+
+    def _skip_rope_for_nsa_tilelang_fused(self: DeepseekV2AttentionMLA) -> bool:
+        """
+        Check if we should skip rope and use fused rope+cache path for TileLang NSA on gfx95.
+        """
+        server_args = get_global_server_args()
+        return (
+            _use_aiter_gfx95
+            and self.current_attention_backend == "nsa"
+            and (
+                server_args.nsa_decode_backend == "tilelang"
+                or server_args.nsa_prefill_backend == "tilelang"
+            )
         )
