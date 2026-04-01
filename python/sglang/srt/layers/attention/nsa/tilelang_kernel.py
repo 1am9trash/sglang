@@ -1067,6 +1067,9 @@ def sparse_mla_fwd_decode_partial_fp8(
         topk % block_I == 0
     ), "otherwise will load some index=0 thus causing wrong kv to be loaded"
 
+    # Softmax scores are in [0, 1]. We scale by fp8_max_val before FP8 cast
+    # to better utilize FP8 dynamic range, then apply the inverse scale after GEMM.
+    # This is numerically safe because softmax output is bounded by 1.
     fp8_dtype = "float8_e4m3fnuz" if _is_fp8_fnuz else "float8_e4m3fn"
     fp8_max_val = 240.0 if _is_fp8_fnuz else 448.0
     s_inv_scale_const = fp8_max_val
