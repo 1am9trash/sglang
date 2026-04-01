@@ -47,7 +47,12 @@ def fast_round_scale(amax, fp8_max_inv):
 
 @lru_cache(maxsize=8)
 def _pick_inner_iter(seq: int, ni: int, cu: int, block_per_cu: int) -> int:
-    """Largest inner_iter <= NI that keeps grid/CU >= block_per_cu."""
+    """
+    Pick the largest valid inner_iter (power-of-two divisor of ni) that keeps
+    enough work per CU (seq * ni / inner_iter / cu >= block_per_cu), so we avoid
+    under-utilization while minimizing the number of partial groups.
+    """
+
     max_it = int(seq * ni / (cu * block_per_cu))
     it = ni
     while it >= 2:
