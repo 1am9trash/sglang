@@ -383,7 +383,8 @@ class Indexer(MultiPlatformOp):
 
     @staticmethod
     def _update_rope_guarded(dst: torch.Tensor, src: torch.Tensor) -> None:
-        # Fast path: source and destination share the same first element address.
+        # On AMD with in-place RoPE kernels, self-aliasing can occur;
+        # skip write-back when src/dst tensors point to a single memory.
         if src.data_ptr() == dst.data_ptr():
             return
         dst.copy_(src)
