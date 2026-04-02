@@ -318,8 +318,8 @@ class Indexer(MultiPlatformOp):
 
         q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
 
-        query[..., : self.rope_head_dim] = q_rope.clone()
-        key[..., : self.rope_head_dim] = k_rope.clone()
+        self._update_rope_guarded(query[..., : self.rope_head_dim], q_rope)
+        self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
 
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
@@ -376,10 +376,17 @@ class Indexer(MultiPlatformOp):
         )
 
         _, k_rope = self.rotary_emb(positions, k_rope, k_rope)
-        key[..., : self.rope_head_dim] = k_rope.clone()
+        self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
         key = rotate_activation(key)
 
         return key
+
+    @staticmethod
+    def _update_rope_guarded(dst: torch.Tensor, src: torch.Tensor) -> None:
+        # Fast path: source and destination share the same first element address.
+        if src.data_ptr() == dst.data_ptr():
+            return
+        dst.copy_(src)
 
     def _get_topk_paged(
         self,
