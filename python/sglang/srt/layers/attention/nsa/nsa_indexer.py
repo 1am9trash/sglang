@@ -257,13 +257,13 @@ class Indexer(MultiPlatformOp):
         weights, _ = self.weights_proj(x)
         return weights.float()
 
-    @torch.compile(dynamic=True) if not _is_hip else lambda f: f
+    @torch.compile(dynamic=True)
     def _project_and_scale_head_gates(self, x: torch.Tensor):
         weights = self._weights_proj_bf16_in_fp32_out(x)
         weights = weights * self.n_heads**-0.5
         return weights
 
-    @torch.compile(dynamic=True) if not _is_hip else lambda f: f
+    @torch.compile(dynamic=True)
     def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
         weights = self._weights_proj_bf16_in_fp32_out(x)
         weights = weights * self.n_heads**-0.5
