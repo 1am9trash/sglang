@@ -1854,20 +1854,17 @@ class NSATokenToKVPool(MLATokenToKVPool):
             if self.custom_mem_pool
             else nullcontext()
         ):
+            per_token_dim = index_head_dim + index_head_dim // self.quant_block_size * 4
+            if _is_hip:
+                # Align per-token dimension to 16 bytes so that
+                # kv_cache.stride(0) % 16 == 0, enabling is_padded_mode=True
+                # in the Gluon paged MQA logits kernel (aligned vector loads).
+                per_token_dim = (per_token_dim + 15) // 16 * 16
             self.index_k_with_scale_buffer = [
                 torch.zeros(
-                    # Layout:
-                    #     ref: test_attention.py :: kv_cache_cast_to_fp8
-                    #     shape: (num_pages, page_size 64 * head_dim 128 + page_size 64 * fp32_nbytes 4)
-                    #     data: for page i,
-                    #         * buf[i, :page_size * head_dim] for fp8 data
-                    #         * buf[i, page_size * head_dim:].view(float32) for scale
                     (
                         (index_buf_size + page_size + 1) // self.page_size,
-                        self.page_size
-                        * (
-                            index_head_dim + index_head_dim // self.quant_block_size * 4
-                        ),
+                        self.page_size * per_token_dim,
                     ),
                     dtype=self.index_k_with_scale_buffer_dtype,
                     device=device,

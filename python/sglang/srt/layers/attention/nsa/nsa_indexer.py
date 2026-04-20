@@ -461,7 +461,7 @@ class Indexer(MultiPlatformOp):
         assert len(kv_cache_fp8.shape) == 2
         block_kv = 1 if _is_hip else 64
         num_heads_kv = 1
-        head_dim_with_sf = 132
+        head_dim_with_sf = kv_cache_fp8.shape[1] // (block_kv * num_heads_kv)
         if _is_hip:
             kv_cache_fp8 = kv_cache_fp8.view(
                 -1, block_kv, num_heads_kv, head_dim_with_sf
@@ -480,20 +480,20 @@ class Indexer(MultiPlatformOp):
             from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
             batch_size, next_n, heads, _ = q_fp8.shape
-            logits = torch.full(
+            logits = torch.empty(
                 (batch_size * next_n, max_seq_len),
-                float("-inf"),
                 device=q_fp8.device,
                 dtype=torch.float32,
             )
+            max_block_len = min(block_tables.shape[1], 16384)
             deepgemm_fp8_paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,
                 weights,
                 logits,
                 seqlens_32,
-                block_tables,
-                max_seq_len,
+                block_tables[:, :max_block_len],
+                max_block_len,
                 Preshuffle=False,
                 KVBlockSize=block_kv,
             )

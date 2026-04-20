@@ -365,7 +365,8 @@ def _set_k_and_s_triton(
             f"index_k_scale must be 1D or 2D, got shape {index_k_scale.shape}"
         )
     if _is_hip:
-        assert buf_numel_per_page == 1 * (128 + 4)
+        per_token_dim = (128 + 4 + 15) // 16 * 16
+        assert buf_numel_per_page == 1 * per_token_dim
     else:
         assert buf_numel_per_page == 64 * (128 + 4)
     assert num_tokens_to_write == num_tokens_to_write_ == num_tokens_to_write__
