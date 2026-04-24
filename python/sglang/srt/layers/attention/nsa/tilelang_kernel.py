@@ -1159,20 +1159,7 @@ def dpsk_v4_bf16_sparse_attention_kernel(
     return main
 
 
-def _apply_topk_length_mask(
-    indices: torch.Tensor, topk_length: Optional[torch.Tensor]
-) -> torch.Tensor:
-    """Invalidate indices beyond topk_length (per batch)."""
-    if topk_length is None:
-        return indices
-    topk = indices.shape[-1]
-    arange = torch.arange(topk, device=indices.device, dtype=topk_length.dtype)
-    # indices: [b, s_q, 1, topk]; topk_length: [b]
-    invalid = arange.view(1, 1, 1, -1) >= topk_length.view(-1, 1, 1, 1)
-    return indices.masked_fill(invalid, -1)
-
-
-def bf16_sparse_attention_fwd(
+def dpsk_v4_bf16_sparse_attention_fwd(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     block_table: Optional[torch.Tensor],
@@ -1190,17 +1177,11 @@ def bf16_sparse_attention_fwd(
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Drop-in replacement for `flash_mla_with_kvcache_torch` on AMD.
-
-    Signature matches `flash_mla_with_kvcache_torch` /
-    `flash_mla.flash_mla_with_kvcache`.
-    """
-    # Lazy import to avoid coupling nsa tilelang kernels with flashmla_tests.
     from sglang.srt.flashmla_tests import quant
 
     assert head_dim_v == 512
-    assert is_fp8_kvcache, "bf16_sparse_attention_fwd only supports FP8 KV cache"
 
+    # select hyperconfig
     if _is_gfx95_supported:
         block_I = 64
         threads = 256
@@ -1214,30 +1195,36 @@ def bf16_sparse_attention_fwd(
         use_swizzle = False  # MI300 has only 64KB LDS, be conservative
         use_q_shared = False
     else:
-        raise RuntimeError(
-            "bf16_sparse_attention_fwd only supports AMD gfx94x (MI300) / gfx95x (MI355)"
-        )
+        raise Exception("Only support gf94x, gf95x")
 
     num_heads = q.shape[2]
+    batch, seq_len, _, _ = q.shape
+
+    # q
     q = q.contiguous()
 
-    fp8_layout = quant.FP8KVCacheLayout.MODEL1_FP8Sparse
-
-    k_bf16 = quant.dequantize_k_cache(k_cache.view(FP8_), fp8_layout)
+    # k cache
+    k_bf16 = quant.dequantize_k_cache(
+        k_cache.view(FP8_), quant.FP8KVCacheLayout.MODEL1_FP8Sparse
+    )
     num_blocks, block_size = k_bf16.shape[0], k_bf16.shape[1]
     seq_len_kv = num_blocks * block_size
     k_bf16 = k_bf16.reshape(seq_len_kv, 1, 512).unsqueeze(0).contiguous()
 
-    assert indices is not None
-    indices = indices.unsqueeze(2).contiguous().to(torch.int32)
+    # indices
+    indices = indices.unsqueeze(2).contiguous()
     topk = indices.shape[-1]
-    indices = _apply_topk_length_mask(indices, topk_length)
+    if topk_length is not None:
+        for bi in range(batch):
+            valid = int(topk_length[bi].item())
+            if valid < topk:
+                indices[bi, :, :, valid:] = -1
 
+    # attn_sink
     if attn_sink is None:
         attn_sink = torch.full(
             (num_heads,), float("-inf"), dtype=torch.float32, device=q.device
         )
-
     not_use_extra_k = extra_k_cache is None
 
     kernel = dpsk_v4_bf16_sparse_attention_kernel(
@@ -1245,12 +1232,10 @@ def bf16_sparse_attention_fwd(
         topk,
         dim=448,
         tail_dim=64,
-        sm_scale=softmax_scale or 0.0,
+        sm_scale=softmax_scale,
         block_I=block_I,
         num_stages=num_stages,
         threads=threads,
-        # When there is no extra-K, apply attn_sink inside the kernel;
-        # otherwise apply it once at the end after LSE merge.
         use_attn_sink=not_use_extra_k,
         use_swizzle=use_swizzle,
         use_q_shared=use_q_shared,
@@ -1259,71 +1244,79 @@ def bf16_sparse_attention_fwd(
 
     if not_use_extra_k:
         return o1, lse1
-
-    # extra k cache path: run a second kernel over extra KV and merge via LSE.
-    extra_k_bf16 = quant.dequantize_k_cache(extra_k_cache.view(FP8_), fp8_layout)
-    num_blocks, block_size = extra_k_bf16.shape[0], extra_k_bf16.shape[1]
-    seq_len_kv = num_blocks * block_size
-    extra_k_bf16 = extra_k_bf16.reshape(seq_len_kv, 1, 512).unsqueeze(0).contiguous()
-
-    assert extra_indices_in_kvcache is not None
-    extra_indices = extra_indices_in_kvcache.unsqueeze(2).contiguous().to(torch.int32)
-    extra_topk = extra_indices.shape[-1]
-    extra_indices = _apply_topk_length_mask(extra_indices, extra_topk_length)
-
-    kernel = dpsk_v4_bf16_sparse_attention_kernel(
-        num_heads,
-        extra_topk,
-        dim=448,
-        tail_dim=64,
-        sm_scale=softmax_scale or 0.0,
-        block_I=block_I,
-        num_stages=num_stages,
-        threads=threads,
-        use_attn_sink=False,
-        use_swizzle=use_swizzle,
-        use_q_shared=use_q_shared,
-    )
-    o2, lse2 = kernel(q, extra_k_bf16, extra_indices, attn_sink)
-
-    def _merge_two_attn_out_lse(
-        o1: torch.Tensor,
-        lse1: torch.Tensor,
-        o2: torch.Tensor,
-        lse2: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        both_finite = torch.isfinite(lse1) & torch.isfinite(lse2)
-        lse_total = torch.where(
-            both_finite,
-            torch.logsumexp(torch.stack([lse1, lse2], dim=0), dim=0),
-            torch.where(torch.isfinite(lse1), lse1, lse2),
+    else:
+        # extra k cache
+        extra_k_bf16 = quant.dequantize_k_cache(
+            extra_k_cache.view(FP8_), quant.FP8KVCacheLayout.MODEL1_FP8Sparse
         )
-        w1 = torch.where(
-            both_finite,
-            torch.exp(lse1 - lse_total),
-            torch.where(
-                torch.isfinite(lse1),
-                torch.ones_like(lse1),
-                torch.zeros_like(lse1),
-            ),
+        num_blocks, block_size = extra_k_bf16.shape[0], extra_k_bf16.shape[1]
+        seq_len_kv = num_blocks * block_size
+        extra_k_bf16 = (
+            extra_k_bf16.reshape(seq_len_kv, 1, 512).unsqueeze(0).contiguous()
         )
-        w2 = torch.where(
-            both_finite,
-            torch.exp(lse2 - lse_total),
-            torch.where(
-                torch.isfinite(lse2),
-                torch.ones_like(lse2),
-                torch.zeros_like(lse2),
-            ),
+
+        # indices
+        extra_indices = extra_indices_in_kvcache.unsqueeze(2).contiguous()
+        extra_topk = extra_indices.shape[-1]
+        if extra_topk_length is not None:
+            for bi in range(batch):
+                valid = int(extra_topk_length[bi].item())
+                if valid < extra_topk:
+                    extra_indices[bi, :, :, valid:] = -1
+
+        kernel = dpsk_v4_bf16_sparse_attention_kernel(
+            num_heads,
+            extra_topk,
+            dim=448,
+            tail_dim=64,
+            sm_scale=softmax_scale,
+            block_I=block_I,
+            num_stages=num_stages,
+            threads=threads,
+            use_attn_sink=not_use_extra_k,
+            use_swizzle=use_swizzle,
+            use_q_shared=use_q_shared,
         )
-        o_total = w1.unsqueeze(-1) * o1.float() + w2.unsqueeze(-1) * o2.float()
-        return o_total, lse_total
+        o2, lse2 = kernel(q, extra_k_bf16, extra_indices, attn_sink)
 
-    o_merged, lse_merged = _merge_two_attn_out_lse(o1, lse1, o2, lse2)
+        def _merge_two_attn_out_lse(
+            o1: torch.Tensor,
+            lse1: torch.Tensor,
+            o2: torch.Tensor,
+            lse2: torch.Tensor,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            both_finite = torch.isfinite(lse1) & torch.isfinite(lse2)
+            lse_total = torch.where(
+                both_finite,
+                torch.logsumexp(torch.stack([lse1, lse2], dim=0), dim=0),
+                torch.where(torch.isfinite(lse1), lse1, lse2),
+            )
+            w1 = torch.where(
+                both_finite,
+                torch.exp(lse1 - lse_total),
+                torch.where(
+                    torch.isfinite(lse1),
+                    torch.ones_like(lse1),
+                    torch.zeros_like(lse1),
+                ),
+            )
+            w2 = torch.where(
+                both_finite,
+                torch.exp(lse2 - lse_total),
+                torch.where(
+                    torch.isfinite(lse2),
+                    torch.ones_like(lse2),
+                    torch.zeros_like(lse2),
+                ),
+            )
+            o_total = w1.unsqueeze(-1) * o1.float() + w2.unsqueeze(-1) * o2.float()
+            return o_total, lse_total
 
-    attn_sink_br = attn_sink.view(1, 1, -1)
-    o_scale = torch.sigmoid(lse_merged - attn_sink_br)
-    output = (o_merged.float() * o_scale.unsqueeze(-1)).to(q.dtype)
-    lse_ok = torch.isfinite(lse_merged).unsqueeze(-1)
-    output = torch.where(lse_ok, output, torch.zeros_like(output))
-    return output, lse_merged
+        o1, lse1 = _merge_two_attn_out_lse(o1, lse1, o2, lse2)
+
+        attn_sink_br = attn_sink.view(1, 1, -1)
+        o_scale = torch.sigmoid(lse1 - attn_sink_br)
+        output = (o1.float() * o_scale.unsqueeze(-1)).to(q.dtype)
+        lse_ok = torch.isfinite(lse1).unsqueeze(-1)
+        output = torch.where(lse_ok, output, torch.zeros_like(output))
+        return output, lse1
