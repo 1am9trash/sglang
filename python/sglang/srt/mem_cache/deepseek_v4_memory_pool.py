@@ -629,8 +629,23 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         item_lens: List[int] = []
 
         if self._unified_kv:
+            swa_pages = self.unified_kv_pool.swa_pages
+            stage_ratios = self.compression_ratios[self._stage_start : self._stage_end]
+            compress_bufs = []
+            for buf, ratio in zip(self.unified_kv_pool.kv_buffer, stage_ratios):
+                if ratio == 0:
+                    continue
+                head_dim = buf.shape[1]
+                rows_per_page = self.page_size // ratio
+                comp = buf[swa_pages:]
+                num_pages = comp.shape[0] // rows_per_page
+                assert num_pages * rows_per_page == comp.shape[0], (
+                    f"unified compress region {comp.shape[0]} rows not divisible "
+                    f"by rows_per_page={rows_per_page} (ratio={ratio})"
+                )
+                compress_bufs.append(comp.view(num_pages, rows_per_page * head_dim))
             buf_groups = [
-                self.unified_kv_pool.kv_buffer,
+                compress_bufs,
                 self.c4_indexer_kv_pool.index_k_with_scale_buffer,
             ]
         else:
@@ -673,6 +688,24 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 data_ptrs.append(t.data_ptr())
                 data_lens.append(t.nbytes)
                 item_lens.append(t[0].nbytes * pool.ring_size)
+
+        return data_ptrs, data_lens, item_lens
+
+    def get_unified_swa_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        data_ptrs: List[int] = []
+        data_lens: List[int] = []
+        item_lens: List[int] = []
+
+        if not self._unified_kv:
+            return data_ptrs, data_lens, item_lens
+
+        swa_pages = self.unified_kv_pool.swa_pages
+        for buf in self.unified_kv_pool.kv_buffer:
+            assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
+            swa_region = buf[:swa_pages]
+            data_ptrs.append(swa_region.data_ptr())
+            data_lens.append(swa_region.nbytes)
+            item_lens.append(buf[0].nbytes)
 
         return data_ptrs, data_lens, item_lens
 

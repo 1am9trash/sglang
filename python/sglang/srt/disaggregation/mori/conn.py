@@ -1048,7 +1048,7 @@ class MoriKVManager(CommonKVManager):
                         dst_dims,
                     )
                 )
-            elif st in ("swa", "dsa"):
+            elif st in ("swa", "dsa", "unified_swa"):
                 statuses.extend(
                     self._send_swa_dsa_state(
                         peer_info,

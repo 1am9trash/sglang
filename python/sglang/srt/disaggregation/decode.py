@@ -1011,6 +1011,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     kv_indices_full.cpu().numpy(), device_page_size
                 )
 
+            def _unified_swa_payload():
+                # [slot*ring, slot*ring+ring)
+                pool = self.token_to_kv_pool_allocator.get_kvcache()
+                ring = pool.unified_swa_ring_size
+                base = decode_req.req.req_pool_idx * ring
+                rows = np.arange(base, base + ring, dtype=np.int32)
+                return kv_to_page_indices(rows, 1)
+
             state_types = self.kv_manager.kv_args.state_types
             state_indices: Optional[List] = []
             for st in state_types:
@@ -1020,6 +1028,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     state_indices.append(_swa_payload())
                 elif st == StateType.DSA:
                     state_indices.append(_dsa_payload())
+                elif st == StateType.UNIFIED_SWA:
+                    state_indices.append(_unified_swa_payload())
                 else:
                     state_indices.append(None)
 

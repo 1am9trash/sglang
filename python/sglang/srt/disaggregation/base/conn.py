@@ -18,6 +18,8 @@ class StateType(str, enum.Enum):
     MAMBA = "mamba"
     SWA = "swa"
     DSA = "dsa"
+    # Support deepseek-v4 unified_kv
+    UNIFIED_SWA = "unified_swa"
 
 
 @dataclasses.dataclass

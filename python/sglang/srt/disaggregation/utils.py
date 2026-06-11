@@ -669,6 +669,13 @@ def setup_state_kv_args(
                     kv_args, StateType.DSA, data_ptrs, data_lens, item_lens
                 )
 
+    if hasattr(token_to_kv_pool, "get_unified_swa_buf_infos"):
+        data_ptrs, data_lens, item_lens = token_to_kv_pool.get_unified_swa_buf_infos()
+        if data_ptrs:
+            append_state_component(
+                kv_args, StateType.UNIFIED_SWA, data_ptrs, data_lens, item_lens
+            )
+
     if (
         StateType.MAMBA not in kv_args.state_types
         and req_to_token_pool is not None

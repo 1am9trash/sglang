@@ -982,6 +982,14 @@ class SchedulerDisaggregationPrefillMixin:
                 ]
                 return kv_to_page_indices(kv_indices_full.cpu().numpy(), page_size)
 
+            def _unified_swa_payload():
+                # [slot*ring, slot*ring+ring)
+                pool = self.token_to_kv_pool_allocator.get_kvcache()
+                ring = pool.unified_swa_ring_size
+                base = req.req_pool_idx * ring
+                rows = torch.arange(base, base + ring, dtype=torch.int32)
+                return kv_to_page_indices(rows.numpy(), 1)
+
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
             )
@@ -993,6 +1001,8 @@ class SchedulerDisaggregationPrefillMixin:
                     state_indices.append(_swa_payload())
                 elif st == StateType.DSA:
                     state_indices.append(_dsa_payload())
+                elif st == StateType.UNIFIED_SWA:
+                    state_indices.append(_unified_swa_payload())
                 else:
                     state_indices.append(None)
 
