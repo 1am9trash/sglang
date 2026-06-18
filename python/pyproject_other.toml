@@ -24,7 +24,7 @@ runtime_common = [
   "blobfile==3.0.0",
   "av",
   "build",
-  "compressed-tensors",
+  "compressed-tensors==0.16.0",
   "datasets",
   "easydict",
   "einops",
@@ -96,10 +96,7 @@ srt_hip = [
   "torch",
   "petit_kernel==0.0.2",
   "wave-lang==3.8.2",
-  # Pin to 0.15.0: 0.16.0 needs torch>=2.10 (incompatible with ROCm torch
-  # 2.9.1). An open-ended `<0.16.0` made pip backtrack into an unbuildable
-  # ancient setuptools sdist; an exact pin keeps the resolver converging.
-  "compressed-tensors==0.15.0",
+  # compressed-tensors inherited from runtime_common (0.16.0 for torch 2.12+)
 ]
 
 diffusion_hip = [
