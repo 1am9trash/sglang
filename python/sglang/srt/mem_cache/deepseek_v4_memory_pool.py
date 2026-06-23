@@ -625,6 +625,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self._init_paged_compress_states(enable_memory_saver)
 
     def get_unified_kv(self, layer_id: int) -> torch.Tensor:
+        # Under HiCache the compressed region of this buffer is filled by a
+        # per-layer H->D load; block until that layer's transfer lands before
+        # attention reads it. No-op when HiCache is off (counter is None).
+        self.wait_layer_transfer(layer_id)
         return self.unified_kv_pool.get_unified_kv(layer_id - self._stage_start)
 
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
@@ -711,6 +715,41 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             data_lens.append(swa_pages * row_bytes)
             item_lens.append(row_bytes)
         return data_ptrs, data_lens, item_lens
+
+    def unified_region_buffers(self, ratio: int) -> Tuple[List[torch.Tensor], int]:
+        """Per-layer ``narrow`` views into the compressed region ``[swa_pages:]``
+        of the unified_kv buffer for ``ratio`` (4 or 128), plus the per-page item
+        size in bytes.
+
+        ``narrow`` shares storage with the device buffer, so each view's
+        ``data_ptr()`` already points past the SWA ring (== ``base + swa_pages *
+        row_bytes``). HiCache can therefore mirror the compressed family with the
+        plain paged host pool and the existing paged-row transfer kernels, with no
+        SWA-offset bookkeeping. The page index those kernels consume is
+        ``loc // ratio`` measured from the compressed start, which matches the
+        legacy standalone c4/c128 pool layout, so device indices need no remap.
+
+        One model page (``page_size`` full tokens) maps to ``page_size // ratio``
+        compressed rows, hence ``item_bytes = rows_per_page * row_bytes``. This
+        mirrors the unified branch of :meth:`get_contiguous_buf_infos`.
+        """
+        assert self._unified_kv, "unified_region_buffers requires unified_kv layout"
+        assert ratio in (4, 128), f"unsupported compression ratio: {ratio}"
+
+        swa_pages = self.unified_kv_pool.swa_pages
+        stage_ratios = self.compression_ratios[self._stage_start : self._stage_end]
+        local_layer_ids = [i for i, r in enumerate(stage_ratios) if r == ratio]
+
+        views: List[torch.Tensor] = []
+        for local_layer_id in local_layer_ids:
+            buf = self.unified_kv_pool.kv_buffer[local_layer_id]
+            compress_rows = buf.shape[0] - swa_pages
+            views.append(buf.narrow(0, swa_pages, compress_rows))
+
+        rows_per_page = self.page_size // ratio
+        row_bytes = views[0][0].nbytes if views else 0
+        item_bytes = rows_per_page * row_bytes
+        return views, item_bytes
 
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []

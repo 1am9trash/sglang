@@ -596,6 +596,13 @@ class SWAComponent(TreeComponent):
     ) -> Optional[list[PoolTransfer]]:
         ct = self.component_type
 
+        # unified_kv keeps SWA in a per-request ring that is not
+        # content-addressable, so no host SWA pool is attached. Without a host
+        # pool the component stays device-only: evicted windows tombstone and are
+        # recomputed on the next prefill rather than loaded back from host.
+        if self._swa_kv_pool_host is None:
+            return None
+
         if phase == CacheTransferPhase.BACKUP_HOST:
             cd = node.component_data[ct]
             if cd.value is None:
