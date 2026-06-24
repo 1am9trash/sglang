@@ -108,12 +108,27 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
         state = {"len": float("inf")}
 
+        # unified_kv keeps SWA in a per-request ring that is never backed up to
+        # host (no SWA host pool). For such a node a host-backed FULL prefix is
+        # still a usable boundary: load_back restores the compressed prefix, and
+        # the trailing sliding window of SWA is recomputed by re-prefilling it
+        # (init_load_back holds that window back from the reused prefix). So a
+        # host-only SWA tombstone must not block best_match_node here, otherwise
+        # load_back never triggers.
+        swa_device_only_hicache = (
+            self._swa_kv_pool_host is None and self.cache.cache_controller is not None
+        )
+
         def validator(node: UnifiedTreeNode) -> bool:
             cd = node.component_data[ct]
             # HiCache: a host-only tombstone is a valid match boundary too
             # — load_back will restore SWA from host before use.
             if cd.value is None and (match_device_only or cd.host_value is None):
                 state["len"] = 0
+                # Device-only SWA + HiCache: allow advancing into a FULL-backed
+                # host node (its SWA window will be recomputed, not loaded).
+                if swa_device_only_hicache and not match_device_only and node.backuped:
+                    return True
                 return False
             state["len"] += len(node.key)
             return state["len"] >= sliding_window_size
