@@ -108,13 +108,14 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
         state = {"len": float("inf")}
 
-        # unified_kv keeps SWA in a per-request ring that is never backed up to
-        # host (no SWA host pool). For such a node a host-backed FULL prefix is
-        # still a usable boundary: load_back restores the compressed prefix, and
-        # the trailing sliding window of SWA is recomputed by re-prefilling it
-        # (init_load_back holds that window back from the reused prefix). So a
-        # host-only SWA tombstone must not block best_match_node here, otherwise
-        # load_back never triggers.
+        # unified_kv keeps SWA in a per-request ring that the attention kernels
+        # address by formula (req_pool_idx * ring + pos % ring) and never back up
+        # to host (no SWA host pool). The radix SWA value here is pure bookkeeping
+        # — it is not where unified attention reads/writes SWA. On reuse the ring
+        # holds approximate (stale) SWA for the boundary window regardless, just
+        # like plain radix reuse, which tolerates it. So in this mode SWA must not
+        # gate the match: gating would cap the device match below the FULL prefix
+        # that load_back restored, breaking the cache_protected_len invariant.
         swa_device_only_hicache = (
             self._swa_kv_pool_host is None and self.cache.cache_controller is not None
         )
@@ -125,9 +126,14 @@ class SWAComponent(TreeComponent):
             # — load_back will restore SWA from host before use.
             if cd.value is None and (match_device_only or cd.host_value is None):
                 state["len"] = 0
-                # Device-only SWA + HiCache: allow advancing into a FULL-backed
-                # host node (its SWA window will be recomputed, not loaded).
-                if swa_device_only_hicache and not match_device_only and node.backuped:
+                if swa_device_only_hicache and (node.backuped or not node.evicted):
+                    # unified device-only SWA: don't gate on SWA bookkeeping.
+                    # - host-aware match: a FULL-backed (backuped) node is a valid
+                    #   boundary so load_back can trigger.
+                    # - device match: a FULL-resident (not evicted) node with an
+                    #   SWA tombstone (e.g. its window was loaded back, or SWA fell
+                    #   out of window) stays a valid boundary so the device match
+                    #   follows FULL. SWA is read approximately from the ring.
                     return True
                 return False
             state["len"] += len(node.key)
