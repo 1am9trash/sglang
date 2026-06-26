@@ -135,10 +135,16 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 RUN python3 -m pip install --no-cache-dir -U pip setuptools setuptools_scm wheel
 
-# ROCm SDK — from nightlies (device-all includes gfx1250 support)
+# ROCm SDK + PyTorch stack — single pip install, single index.
+# device-all pulls amd-torch-device-gfx1250 and amd-torchvision-device-gfx1250.
 RUN python3 -m pip install --no-cache-dir \
     --index-url ${INDEX_URL} \
-    "rocm[libraries,devel,device-all]==${ROCM_VERSION}"
+    "rocm[libraries,devel,device-all]==${ROCM_VERSION}" \
+    "torch[device-all]==${TORCH_VERSION}+rocm${ROCM_VERSION}" \
+    "torchvision[device-all]==${TORCHVISION_VERSION}+rocm${ROCM_VERSION}" \
+    "torchaudio==${TORCH_VERSION}+rocm${ROCM_VERSION}" \
+    "triton==${TRITON_VERSION}.rocm${ROCM_VERSION}" \
+    "apex==1.11.0+rocm${ROCM_VERSION}"
 
 RUN rocm-sdk init
 
@@ -149,17 +155,12 @@ ENV LIBRARY_PATH=${ROCM_HOME}/lib
 ENV LD_LIBRARY_PATH=${ROCM_HOME}/lib
 RUN echo 'export PATH=$ROCM_HOME/llvm/bin:$ROCM_HOME/bin:$PATH' >> /etc/bash.bashrc
 
-# torch stack — [device-all] pulls amd-torch-device-gfx1250
-RUN python3 -m pip install --no-cache-dir \
-    --index-url ${INDEX_URL} \
-    "torch[device-all]==${TORCH_VERSION}+rocm${ROCM_VERSION}" \
-    "torchvision[device-all]==${TORCHVISION_VERSION}+rocm${ROCM_VERSION}" \
-    "torchaudio==${TORCH_VERSION}+rocm${ROCM_VERSION}" \
-    "triton==${TRITON_VERSION}.rocm${ROCM_VERSION}" \
-    "apex==1.11.0+rocm${ROCM_VERSION}"
-
 # Workaround: hsakmtTargets.cmake hardcoded /usr/lib64/libc.so
 RUN mkdir -p /usr/lib64 && ln -sf /lib/x86_64-linux-gnu/libc.so /usr/lib64/libc.so
+
+# Workaround: ROCm is pip-installed (not at /opt/rocm). AITER calls amdgpu-arch via
+# /opt/rocm/llvm/bin at runtime to determine DEFAULT_GPU_ARCH. Symlink to pip-installed path.
+RUN ln -s ${ROCM_HOME} /opt/rocm
 
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="0"
