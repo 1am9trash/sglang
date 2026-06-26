@@ -89,8 +89,8 @@ RUN echo 'export PATH=$ROCM_HOME/llvm/bin:$ROCM_HOME/bin:$PATH' >> /etc/bash.bas
 RUN python3 -m pip install --no-cache-dir numpy \
     && python3 -m pip install --no-cache-dir \
          --index-url "${PIP_EXTRA_INDEX_URL}" \
-         "torch==${TORCH_VERSION}" \
-         "torchvision==${TORCHVISION_VERSION}" \
+         "torch[device-all]==${TORCH_VERSION}" \
+         "torchvision[device-all]==${TORCHVISION_VERSION}" \
          "torchaudio==${TORCHAUDIO_VERSION}"
 
 # Workaround: ROCm SDK hsakmtTargets.cmake contains hardcoded /usr/lib64/libc.so from
@@ -111,69 +111,55 @@ ENV AITER_COMMIT_DEFAULT="46e6c92b3eb33f64823aaa1ff39a14586b059ef5"
 
 # ===============================
 # Base image 1250 with rocm7_14 and args
+# Builds from ubuntu:24.04 — installs ROCm SDK and torch stack via pip.
 FROM $BASE_IMAGE_1250_ROCM7_14 AS gfx1250-rocm7_14
 
-# Install Python and system dependencies
+# Version pins — override with --build-arg to update
+ARG ROCM_VERSION="7.14.0a20260623"
+ARG INDEX_URL="https://rocm.nightlies.amd.com/whl-multi-arch/"
+ARG TORCH_VERSION="2.11.0"
+ARG TORCHVISION_VERSION="0.26.0"
+ARG TRITON_VERSION="3.7.0+gitb4e20bbe"
+
+# System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates \
-        curl \
-        git \
-        gnupg \
-        build-essential \
+        ca-certificates curl git gnupg build-essential \
         python3 python3-dev python3-pip python-is-python3 python3.12-venv \
-        wget git \
-        ca-certificates \
-        libstdc++-12-dev \
+        wget libstdc++-12-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Create venv
 ENV VIRTUAL_ENV=/opt/venv
-RUN python -m venv "$VIRTUAL_ENV"
+RUN python3 -m venv "$VIRTUAL_ENV"
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-# Upgrade pip tooling a bit
 RUN python3 -m pip install --no-cache-dir -U pip setuptools setuptools_scm wheel
 
-# ROCm SDK and PyTorch dependencies
-ARG PIP_EXTRA_INDEX_URL="https://rocm.nightlies.amd.com/whl-multi-arch/"
-# Pin to a specific ROCm SDK version (e.g. 7.14.0a20260604). Leave empty for latest.
-ARG ROCM_SDK_VERSION="7.14.0a20260617"
+# ROCm SDK — from nightlies (device-all includes gfx1250 support)
+RUN python3 -m pip install --no-cache-dir \
+    --index-url ${INDEX_URL} \
+    "rocm[libraries,devel,device-all]==${ROCM_VERSION}"
 
-# Install ROCm SDK
-RUN ROCM_SPEC="${ROCM_SDK_VERSION:+==${ROCM_SDK_VERSION}}" \
-    && python3 -m pip install --pre --ignore-installed --no-cache-dir \
-         --index-url "${PIP_EXTRA_INDEX_URL}" \
-         "rocm-sdk-core${ROCM_SPEC}" \
-         "rocm-sdk-devel${ROCM_SPEC}" \
-         "rocm-sdk-libraries${ROCM_SPEC}" \
-         "rocm-sdk-device-gfx1250${ROCM_SPEC}" \
-    && python3 -m pip install --pre ${PIP_EXTRA_INDEX_URL}rocm-7.14.0a20260617.tar.gz
+RUN rocm-sdk init
 
-# Initialize ROCm SDK
-RUN rocm-sdk init && rocm-sdk targets
-ENV ROCM_HOME=$VIRTUAL_ENV/lib/python3.12/site-packages/_rocm_sdk_devel
-ENV CPATH=$ROCM_HOME/include
-ENV LIBRARY_PATH=$ROCM_HOME/lib
-ENV LD_LIBRARY_PATH=$ROCM_HOME/lib
-ENV ROCM_PATH=$ROCM_HOME
+ENV ROCM_HOME=/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel
+ENV ROCM_PATH=${ROCM_HOME}
+ENV CPATH=${ROCM_HOME}/include
+ENV LIBRARY_PATH=${ROCM_HOME}/lib
+ENV LD_LIBRARY_PATH=${ROCM_HOME}/lib
 RUN echo 'export PATH=$ROCM_HOME/llvm/bin:$ROCM_HOME/bin:$PATH' >> /etc/bash.bashrc
 
-# Install PyTorch ROCm wheels
-RUN python3 -m pip install --no-cache-dir numpy \
-    && python3 -m pip install --pre --no-deps --no-cache-dir \
-         --index-url "https://rocm.devreleases.amd.com/v2-staging/gfx1250/" \
-         "torch==2.12.0+rocm7.14.0a20260617" \
-         "torchvision==0.27.0+rocm7.14.0a20260617" \
-         "torchaudio==2.11.0a0+rocm7.14.0a20260617" \
-         "triton==3.7.0+gitb4e20bbe.rocm7.14.0a20260617" \
-         "apex==1.11.0+rocm7.14.0a20260617"
+# torch stack — [device-all] pulls amd-torch-device-gfx1250
+RUN python3 -m pip install --no-cache-dir \
+    --index-url ${INDEX_URL} \
+    "torch[device-all]==${TORCH_VERSION}+rocm${ROCM_VERSION}" \
+    "torchvision[device-all]==${TORCHVISION_VERSION}+rocm${ROCM_VERSION}" \
+    "torchaudio==${TORCH_VERSION}+rocm${ROCM_VERSION}" \
+    "triton==${TRITON_VERSION}.rocm${ROCM_VERSION}" \
+    "apex==1.11.0+rocm${ROCM_VERSION}"
 
-# Workaround: ROCm SDK hsakmtTargets.cmake contains hardcoded /usr/lib64/libc.so from
-# the upstream build system, but Ubuntu uses /lib/x86_64-linux-gnu/. Create symlink to
-# avoid "ninja: error: /usr/lib64/libc.so missing and no known rule to make it"
+# Workaround: hsakmtTargets.cmake hardcoded /usr/lib64/libc.so
 RUN mkdir -p /usr/lib64 && ln -sf /lib/x86_64-linux-gnu/libc.so /usr/lib64/libc.so
-
-# Workaround: At runtime, AITER determines `DEFAULT_GPU_ARCH` by calling
-# `/opt/rocm/llvm/bin/amdgpu-arch`.
-RUN ln -s ${ROCM_HOME} /opt/rocm
 
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="0"
@@ -228,7 +214,12 @@ FROM ${GPU_ARCH}
 
 # This is necessary for scope purpose, again
 ARG GPU_ARCH=gfx950
-ENV GPU_ARCH_LIST=${GPU_ARCH%-*}
+RUN echo GPU_ARCH="${GPU_ARCH}" \
+    && GPU_ARCH_STRIPPED="${GPU_ARCH%%-*}" \
+    && echo "GPU_ARCH_LIST=${GPU_ARCH_STRIPPED}" >> /etc/environment \
+    && echo "export GPU_ARCH_LIST=${GPU_ARCH_STRIPPED}" >> /etc/bash.bashrc
+ARG GPU_ARCH_LIST_ARG=gfx1250
+ENV GPU_ARCH_LIST=${GPU_ARCH_LIST_ARG}
 ENV PYTORCH_ROCM_ARCH=gfx942;gfx950
 
 ARG SGL_REPO="https://github.com/sgl-project/sglang.git"
@@ -405,9 +396,12 @@ RUN git clone ${AITER_REPO} \
 RUN cd aiter \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
      && echo "[AITER] AITER_USE_SYSTEM_TRITON=${AITER_USE_SYSTEM_TRITON}" \
-     && if [ "${GPU_ARCH}" = "gfx950-rocm7_14" ] || [ "${GPU_ARCH}" = "gfx1250-rocm7_14" ]; then \
+     && if [ "${GPU_ARCH}" = "gfx950-rocm7_14" ]; then \
          PATH=$PATH:$ROCM_HOME/llvm/bin PREBUILD_KERNELS=1 GPU_ARCHS="${GPU_ARCH_LIST}" python setup.py build_ext --inplace \
           && PATH=$PATH:$ROCM_HOME/llvm/bin GPU_ARCHS="${GPU_ARCH_LIST}" pip install --no-build-isolation -e .; \
+        elif [ "${GPU_ARCH}" = "gfx1250-rocm7_14" ]; then \
+          PATH=$PATH:$ROCM_HOME/llvm/bin ENABLE_CK=0 GPU_ARCHS="${GPU_ARCH_LIST}" python setup.py build_ext --inplace \
+          && PATH=$PATH:$ROCM_HOME/llvm/bin ENABLE_CK=0 GPU_ARCHS="${GPU_ARCH_LIST}" pip install --no-build-isolation -e .; \
         elif [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
           sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py build_ext --inplace" \
           && sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ GPU_ARCHS=$GPU_ARCH_LIST pip install --config-settings editable_mode=compat -e ."; \
@@ -471,10 +465,12 @@ RUN git clone https://github.com/akao-amd/sglang \
     && cd sgl-kernel \
     && rm -f pyproject.toml \
     && mv pyproject_rocm.toml pyproject.toml \
+    && sed -i 's/if amdgpu_target not in \["gfx942", "gfx950"\]/if amdgpu_target not in ["gfx942", "gfx950", "gfx1250"]/' setup_rocm.py \
     && AMDGPU_TARGET=$GPU_ARCH_LIST python setup_rocm.py install
 RUN pip freeze | grep -E '^(torch|triton)' > /tmp/constraints.txt
 RUN cd sglang \
     && rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml \
+    && sed -i 's/compressed-tensors[^"]*"/compressed-tensors>=0.9.2"/g' python/pyproject.toml \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
          export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install --no-build-isolation -c /tmp/constraints.txt -e "python[srt_hip,diffusion_hip]"; \
        else \
@@ -578,7 +574,6 @@ RUN /bin/bash -lc 'set -euo pipefail; \
     export ROCM_PATH=/opt/rocm; \
   fi; \
   export CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_ROCM=ON -DROCM_PATH=${ROCM_PATH} -DLLVM_CONFIG=${LLVM_CONFIG} -DSKBUILD_SABI_VERSION= ${CMAKE_ARGS:-}" && \
-  "$VENV_PIP" install -e . -v --no-build-isolation --no-deps; \
   if [ -f pyproject.toml ]; then sed -i "/^[[:space:]]*\"torch/d" pyproject.toml || true; fi; \
   "$VENV_PIP" cache purge || true; \
   "$VENV_PY" -c "import tilelang; print(tilelang.__version__)"'
@@ -760,7 +755,6 @@ RUN cd /tmp/whl \
       *rocm720*) \
         echo "ROCm 7.2 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
         python hack.py \
-        && python3 -m pip install --force --no-deps /tmp/${TORCH_ROCM_FILE} \
         && rm -fr /tmp/whl /tmp/${TORCH_ROCM_FILE} \
         ;; \
       *) \
