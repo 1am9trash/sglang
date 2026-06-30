@@ -10,10 +10,17 @@
 #include <cfloat>
 #include <cstdint>
 
-// gfx1250 (RDNA4) is wave32, but its ROCm header requires the __shfl_*_sync
-// mask to be a 64-bit integer; a 32-bit literal trips a static_assert. Other
-// architectures keep the existing 32-bit mask unchanged.
-#if defined(__gfx1250__)
+#if defined(__HIP_PLATFORM_AMD__)
+#include <hip/hip_version.h>
+#endif
+
+// ROCm 7.x headers require the __shfl_*_sync mask to be a 64-bit integer
+// (static_assert sizeof(MaskT) == 8); a 32-bit literal fails to compile. The
+// header internally adjusts the mask for wave32, so a 64-bit mask is correct
+// on all wave sizes. Gate on HIP_VERSION (defined in both the host and device
+// compile passes) rather than an arch macro like __gfx1250__, which is only
+// defined in the device pass and would still fail the host-pass instantiation.
+#if defined(__HIP_PLATFORM_AMD__) && defined(HIP_VERSION) && HIP_VERSION >= 70000000
 #define SGL_WARP_SYNC_MASK 0xFFFFFFFFFFFFFFFFULL
 #else
 #define SGL_WARP_SYNC_MASK 0xFFFFFFFF

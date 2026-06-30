@@ -133,9 +133,7 @@ _is_xpu = is_xpu()
 # gfx1250 (RDNA4) cannot compile the AITER CK topk_gating kernel; fall back to
 # the plain-HIP moe_fused_gate path (which supports sqrtsoftplus).
 _use_aiter = (
-    get_bool_env_var("SGLANG_USE_AITER")
-    and _is_hip
-    and not is_gfx1250_supported()
+    get_bool_env_var("SGLANG_USE_AITER") and _is_hip and not is_gfx1250_supported()
 )
 _is_musa = is_musa()
 
