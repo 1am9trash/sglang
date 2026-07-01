@@ -248,7 +248,8 @@ def _prefill_lengths_kernel(
     positions_ptr,  # [T] int
     chunk_start_ptr,  # [T] int
     page_idx_ptr,  # [T, Wc] int (front-packed, -1 padded)
-    prefix_len_ptr,  # [T] int32 out
+    prefix_len_ptr,  # [T] int32 out (SWA + reserved compress tail)
+    swa_len_ptr,  # [T] int32 out (SWA-prefix count; tail offset for fill_compress_tail)
     extend_len_ptr,  # [T] int32 out
     win: tl.constexpr,
     Wc: tl.constexpr,
@@ -264,6 +265,7 @@ def _prefill_lengths_kernel(
     extend_count = tl.minimum(tpic + 1, win)
     prefix_swa_count = tl.minimum(tl.maximum(cstart - swa_low, 0), win)
     tl.store(extend_len_ptr + t, extend_count)
+    tl.store(swa_len_ptr + t, prefix_swa_count)
     if HAS_COMPRESS:
         nc = 0
         for off in tl.range(0, Wc, BLOCK):
@@ -283,19 +285,17 @@ def _build_prefill_indices_kernel(
     chunk_start_ptr,  # [T] int
     cu_q_ptr,  # [T] int
     state_slot_ptr,  # [T] int
-    page_idx_ptr,  # [T, Wc] int (front-packed, -1 padded)
-    pre_indptr_ptr,  # [T+1] int32 (prefix stream ragged indptr)
+    pre_indptr_ptr,  # [T+1] int32 (prefix stream ragged indptr; compress tail reserved)
     ext_indptr_ptr,  # [T+1] int32 (extend stream ragged indptr)
     pre_out_ptr,
     ext_out_ptr,
-    swa_pages,
     ring_stride,  # SWA ring per-slot stride
     win: tl.constexpr,
-    Wc: tl.constexpr,
-    HAS_COMPRESS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Per token: write extend rows + prefix (SWA ring slots ++ swa_pages+compressed slots) as two ragged segments"""
+    """Per token: write extend rows + SWA-prefix ring slots as two ragged
+    segments. The compressed tail (space reserved in `pre_indptr`) is filled
+    per-layer by `fill_compress_tail`, so it is intentionally not written here."""
     t = tl.program_id(0)
     pos = tl.load(positions_ptr + t).to(tl.int32)
     cstart = tl.load(chunk_start_ptr + t).to(tl.int32)
@@ -324,19 +324,6 @@ def _build_prefill_indices_kernel(
         gp = swa_low + k
         tl.store(pre_out_ptr + pbase + k, s * ring_stride + (gp % ring_stride), mask=m)
 
-    # ---- prefix compressed: swa_pages + front-packed page index ----
-    if HAS_COMPRESS:
-        nc = tl.load(pre_indptr_ptr + t + 1) - pbase - prefix_swa_count
-        cbase = pbase + prefix_swa_count
-        for off in tl.range(0, Wc, BLOCK):
-            j = off + tl.arange(0, BLOCK)
-            m = j < nc
-            j_clamped = tl.minimum(j, Wc - 1)
-            pi = tl.load(page_idx_ptr + t * Wc + j_clamped, mask=m, other=0).to(
-                tl.int32
-            )
-            tl.store(pre_out_ptr + cbase + j, pi + swa_pages, mask=m)
-
 
 def build_prefill_indices(
     *,
@@ -347,11 +334,20 @@ def build_prefill_indices(
     cu_q: torch.Tensor,  # [T] int (row in extend `kv` of the seq's first chunk token)
     win: int,  # SWA attention window length
     ring_stride: int,  # SWA ring per-slot stride / modulo (win_with_spec)
-    swa_pages: int,
     c128_page_indices: Optional[torch.Tensor],
     c4_sparse_page_indices: Optional[torch.Tensor],
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build ragged prefill indices: prefix (SWA ring + swa_pages + compressed) into unified_kv + extend into current-chunk kv; returns (prefix_indices, prefix_indptr, extend_indices, extend_indptr)."""
+) -> Tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    """Build the layer-invariant ragged prefill base: SWA-prefix ring slots
+    into unified_kv + extend rows into current-chunk kv. The prefix indptr
+    reserves space for the compressed tail (sized from the passed page_idx
+    count), but the tail itself is written per-layer by `fill_compress_tail`.
+
+    Returns ``(prefix_indices, prefix_indptr, extend_indices, extend_indptr,
+    prefix_swa_len, compress_len)`` where ``prefix_swa_len`` is the per-token
+    SWA slot count (tail write offset) and ``compress_len`` the per-token
+    reserved compressed-slot count (fill_compress_tail ``valid_len``)."""
     device = state_slot.device
     T = state_slot.shape[0]
     assert positions.is_contiguous() and chunk_start.is_contiguous()
@@ -375,12 +371,14 @@ def build_prefill_indices(
 
     block = min(1024, triton.next_power_of_2(max(win, Wc, 1)))
     prefix_len = torch.empty(T, dtype=torch.int32, device=device)
+    swa_len = torch.empty(T, dtype=torch.int32, device=device)
     extend_len = torch.empty(T, dtype=torch.int32, device=device)
     _prefill_lengths_kernel[(T,)](
         positions,
         chunk_start,
         page_idx if has_compress else positions,  # dummy ptr when no compress
         prefix_len,
+        swa_len,
         extend_len,
         win=win,
         Wc=Wc if has_compress else 1,
@@ -399,20 +397,23 @@ def build_prefill_indices(
         chunk_start,
         cu_q,
         state_slot,
-        page_idx if has_compress else state_slot,  # dummy ptr when no compress
         kv_indptr_prefix,
         kv_indptr_extend,
         kv_indices_prefix,
         kv_indices_extend,
-        swa_pages,
         ring_stride,
         win=win,
-        Wc=Wc if has_compress else 1,
-        HAS_COMPRESS=has_compress,
         BLOCK=block,
         num_warps=4,
     )
-    return kv_indices_prefix, kv_indptr_prefix, kv_indices_extend, kv_indptr_extend
+    return (
+        kv_indices_prefix,
+        kv_indptr_prefix,
+        kv_indices_extend,
+        kv_indptr_extend,
+        swa_len,
+        prefix_len - swa_len,
+    )
 
 
 def prefill(

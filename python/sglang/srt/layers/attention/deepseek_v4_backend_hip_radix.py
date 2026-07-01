@@ -118,6 +118,12 @@ class UnifiedKvMetadata:
     c4_out_loc: Optional[torch.Tensor] = None
     c128_out_loc: Optional[torch.Tensor] = None
 
+    # Per-forward, per-compress_ratio cache of the layer-invariant prefill base
+    # (SWA-prefix + extend indices/indptr). Reset each forward in
+    # `_attach_unified_kv_prefill_meta`; deliberately excluded from `copy_`
+    # (rebuilt per forward, never copied across cuda-graph replays).
+    prefill_base: dict = field(default_factory=dict)
+
     def copy_(self, other: UnifiedKvMetadata) -> None:
         copy_metadata(
             src=other,
@@ -1112,6 +1118,9 @@ class DeepseekV4HipRadixBackend(
         )
         if core.unified is None:
             core.unified = UnifiedKvMetadata()
+        # Reset the per-forward prefill-base cache (a reused metadata object may
+        # carry a stale cache from a previous forward).
+        core.unified.prefill_base = {}
         core.unified.pf_state_slot = req_pool_indices[bid]
         core.unified.pf_chunk_start = (seq_lens - extend_seq_lens)[bid]
         cu_q_per_req = torch.cumsum(extend_seq_lens, dim=0) - extend_seq_lens
@@ -1242,23 +1251,56 @@ class DeepseekV4HipRadixBackend(
                 : state_slot_full.shape[0]
             ].contiguous()
 
-        kpre_i, kpre_p, kext_i, kext_p = runtime.build_prefill_indices(
-            compress_ratio=compress_ratio,
-            state_slot=state_slot,
-            positions=positions,
-            chunk_start=chunk_start,
-            cu_q=cu_q,
-            win=win,
-            ring_stride=ring_stride,
-            swa_pages=swa_pages,
-            c128_page_indices=c128_pi,
-            c4_sparse_page_indices=c4_pi,
-        )
+        # The SWA-prefix + extend base is layer-invariant (depends only on
+        # positions/state_slot/chunk_start/cu_q), so build it once per forward
+        # per compress_ratio and cache it. Only the compressed tail differs:
+        #   - ratio 128 (HCA): positional page map → layer-invariant, filled once
+        #     when the base is built.
+        #   - ratio 4 (CSA): per-layer indexer top-k → refilled every C4 layer.
+        base_cache = core_attn_metadata.unified.prefill_base
+        base = base_cache.get(compress_ratio)
+        if base is None:
+            kpre_i, kpre_p, kext_i, kext_p, pre_swa_len, cmp_len = (
+                runtime.build_prefill_indices(
+                    compress_ratio=compress_ratio,
+                    state_slot=state_slot,
+                    positions=positions,
+                    chunk_start=chunk_start,
+                    cu_q=cu_q,
+                    win=win,
+                    ring_stride=ring_stride,
+                    c128_page_indices=c128_pi,
+                    c4_sparse_page_indices=c4_pi,
+                )
+            )
+            if kpre_p.shape[0] < T + 1:
+                pad = T + 1 - kpre_p.shape[0]
+                kpre_p = torch.cat([kpre_p, kpre_p[-1:].expand(pad)])
+                kext_p = torch.cat([kext_p, kext_p[-1:].expand(pad)])
+            if compress_ratio == 128:
+                runtime.fill_compress_tail(
+                    indices=kpre_i,
+                    indptr=kpre_p,
+                    prefix_len=pre_swa_len,
+                    page_indices=c128_pi[:T],
+                    valid_len=cmp_len,
+                    swa_pages=swa_pages,
+                )
+            base = (kpre_i, kpre_p, kext_i, kext_p, pre_swa_len, cmp_len)
+            base_cache[compress_ratio] = base
 
-        if kpre_p.shape[0] < T + 1:
-            pad = T + 1 - kpre_p.shape[0]
-            kpre_p = torch.cat([kpre_p, kpre_p[-1:].expand(pad)])
-            kext_p = torch.cat([kext_p, kext_p[-1:].expand(pad)])
+        kpre_i, kpre_p, kext_i, kext_p, pre_swa_len, cmp_len = base
+
+        # CSA tail is the current layer's indexer top-k → refill every C4 layer.
+        if compress_ratio == 4:
+            runtime.fill_compress_tail(
+                indices=kpre_i,
+                indptr=kpre_p,
+                prefix_len=pre_swa_len,
+                page_indices=c4_pi[:T],
+                valid_len=cmp_len,
+                swa_pages=swa_pages,
+            )
         o = runtime.prefill(
             q=q,
             unified_kv=unified,
