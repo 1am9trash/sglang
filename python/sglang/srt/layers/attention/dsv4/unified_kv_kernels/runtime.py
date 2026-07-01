@@ -247,18 +247,16 @@ def build_decode_streams(
 def _prefill_lengths_kernel(
     positions_ptr,  # [T] int
     chunk_start_ptr,  # [T] int
-    page_idx_ptr,  # [T, Wc] int (front-packed, -1 padded)
-    compress_len_ptr,  # [T] int (positional compressed-slot count; USE_COMPRESS_LEN)
+    compress_len_ptr,  # [T] int (positional compressed-slot count; HAS_COMPRESS)
     prefix_len_ptr,  # [T] int32 out (SWA + reserved compress tail)
     swa_len_ptr,  # [T] int32 out (SWA-prefix count; tail offset for fill_compress_tail)
     extend_len_ptr,  # [T] int32 out
     win: tl.constexpr,
-    Wc: tl.constexpr,
     HAS_COMPRESS: tl.constexpr,
-    USE_COMPRESS_LEN: tl.constexpr,  # reserve from compress_len (base) vs count page_idx (legacy)
-    BLOCK: tl.constexpr,
 ):
-    """Per token: write extend/prefix segment lengths"""
+    """Per token: write extend/prefix segment lengths. The compressed tail is
+    reserved from the positional `compress_len` and later written by
+    `fill_compress_tail`."""
     t = tl.program_id(0)
     pos = tl.load(positions_ptr + t).to(tl.int32)
     cstart = tl.load(chunk_start_ptr + t).to(tl.int32)
@@ -269,16 +267,7 @@ def _prefill_lengths_kernel(
     tl.store(extend_len_ptr + t, extend_count)
     tl.store(swa_len_ptr + t, prefix_swa_count)
     if HAS_COMPRESS:
-        if USE_COMPRESS_LEN:
-            nc = tl.load(compress_len_ptr + t).to(tl.int32)
-        else:
-            nc = 0
-            for off in tl.range(0, Wc, BLOCK):
-                j = off + tl.arange(0, BLOCK)
-                m = j < Wc
-                j_clamped = tl.minimum(j, Wc - 1)
-                pi = tl.load(page_idx_ptr + t * Wc + j_clamped, mask=m, other=-1)
-                nc += tl.sum(tl.where(m & (pi >= 0), 1, 0))
+        nc = tl.load(compress_len_ptr + t).to(tl.int32)
         tl.store(prefix_len_ptr + t, prefix_swa_count + nc)
     else:
         tl.store(prefix_len_ptr + t, prefix_swa_count)
@@ -290,19 +279,17 @@ def _build_prefill_indices_kernel(
     chunk_start_ptr,  # [T] int
     cu_q_ptr,  # [T] int
     state_slot_ptr,  # [T] int
-    page_idx_ptr,  # [T, Wc] int (front-packed, -1 padded)
-    pre_indptr_ptr,  # [T+1] int32 (prefix stream ragged indptr)
+    pre_indptr_ptr,  # [T+1] int32 (prefix stream ragged indptr; compress tail reserved)
     ext_indptr_ptr,  # [T+1] int32 (extend stream ragged indptr)
     pre_out_ptr,
     ext_out_ptr,
-    swa_pages,
     ring_stride,  # SWA ring per-slot stride
     win: tl.constexpr,
-    Wc: tl.constexpr,
-    WRITE_COMPRESS: tl.constexpr,  # write compressed tail here (legacy) vs leave to fill_compress_tail (base)
     BLOCK: tl.constexpr,
 ):
-    """Per token: write extend rows + prefix (SWA ring slots ++ swa_pages+compressed slots) as two ragged segments"""
+    """Per token: write extend rows + SWA-prefix ring slots as two ragged
+    segments. The compressed tail (space reserved in `pre_indptr`) is written
+    per-layer by `fill_compress_tail`."""
     t = tl.program_id(0)
     pos = tl.load(positions_ptr + t).to(tl.int32)
     cstart = tl.load(chunk_start_ptr + t).to(tl.int32)
@@ -331,44 +318,24 @@ def _build_prefill_indices_kernel(
         gp = swa_low + k
         tl.store(pre_out_ptr + pbase + k, s * ring_stride + (gp % ring_stride), mask=m)
 
-    # ---- prefix compressed: swa_pages + front-packed page index ----
-    if WRITE_COMPRESS:
-        nc = tl.load(pre_indptr_ptr + t + 1) - pbase - prefix_swa_count
-        cbase = pbase + prefix_swa_count
-        for off in tl.range(0, Wc, BLOCK):
-            j = off + tl.arange(0, BLOCK)
-            m = j < nc
-            j_clamped = tl.minimum(j, Wc - 1)
-            pi = tl.load(page_idx_ptr + t * Wc + j_clamped, mask=m, other=0).to(
-                tl.int32
-            )
-            tl.store(pre_out_ptr + cbase + j, pi + swa_pages, mask=m)
-
 
 def build_prefill_indices(
     *,
-    compress_ratio: int,
     state_slot: torch.Tensor,  # [T] int (per token)
     positions: torch.Tensor,  # [T] int (per token absolute position)
     chunk_start: torch.Tensor,  # [T] int (absolute start of this chunk for token's seq)
     cu_q: torch.Tensor,  # [T] int (row in extend `kv` of the seq's first chunk token)
     win: int,  # SWA attention window length
     ring_stride: int,  # SWA ring per-slot stride / modulo (win_with_spec)
-    swa_pages: int,
-    c128_page_indices: Optional[torch.Tensor],
-    c4_sparse_page_indices: Optional[torch.Tensor],
-    compress_len: Optional[torch.Tensor] = None,
+    compress_len: Optional[
+        torch.Tensor
+    ],  # [T] positional compressed-slot count, None = SWA-only
+    compress_width: int,  # Wc: max compressed slots per token (for buffer sizing)
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build ragged prefill indices: prefix (SWA ring + compressed) into
-    unified_kv + extend into current-chunk kv.
-
-    Two modes:
-      - legacy (``compress_len is None``): the compressed tail is counted from
-        ``page_idx`` and written here (single-pass, per-layer use).
-      - base (``compress_len`` given, a positional [T] count): the prefix
-        indptr reserves the compressed tail but leaves it unwritten for a
-        later per-layer ``fill_compress_tail`` — used to hoist the
-        layer-invariant SWA+extend base out of the per-layer forward.
+    """Build the layer-invariant ragged prefill base: SWA-prefix ring slots
+    into unified_kv + extend rows into current-chunk kv. The prefix indptr
+    reserves the compressed tail (sized from the positional `compress_len`) but
+    leaves it for a later per-layer `fill_compress_tail`.
 
     Returns ``(prefix_indices, prefix_indptr, extend_indices, extend_indptr,
     swa_len)`` where ``swa_len`` is the per-token SWA-prefix slot count (the
@@ -378,43 +345,22 @@ def build_prefill_indices(
     assert positions.is_contiguous() and chunk_start.is_contiguous()
     assert cu_q.is_contiguous() and state_slot.is_contiguous()
 
-    if compress_ratio == 0:
-        page_idx = None
-    elif compress_ratio == 128:
-        assert c128_page_indices is not None
-        page_idx = c128_page_indices[:T]
-    elif compress_ratio == 4:
-        assert c4_sparse_page_indices is not None
-        page_idx = c4_sparse_page_indices[:T]
-    else:
-        raise ValueError(f"bad compress_ratio {compress_ratio}")
+    has_compress = compress_len is not None
+    Wc = compress_width
 
-    has_compress = page_idx is not None
-    if has_compress:
-        assert page_idx.is_contiguous()
-    Wc = page_idx.shape[1] if has_compress else 0
-    # base mode: reserve the compressed tail from the positional length and
-    # leave it for a later per-layer fill_compress_tail.
-    use_compress_len = compress_len is not None
-    write_compress = has_compress and not use_compress_len
-
-    block = min(1024, triton.next_power_of_2(max(win, Wc, 1)))
+    block = min(1024, triton.next_power_of_2(max(win, 1)))
     prefix_len = torch.empty(T, dtype=torch.int32, device=device)
     swa_len = torch.empty(T, dtype=torch.int32, device=device)
     extend_len = torch.empty(T, dtype=torch.int32, device=device)
     _prefill_lengths_kernel[(T,)](
         positions,
         chunk_start,
-        page_idx if has_compress else positions,  # dummy ptr when no compress
-        compress_len if use_compress_len else positions,  # dummy ptr when unused
+        compress_len if has_compress else positions,  # dummy ptr when no compress
         prefix_len,
         swa_len,
         extend_len,
         win=win,
-        Wc=Wc if has_compress else 1,
         HAS_COMPRESS=has_compress,
-        USE_COMPRESS_LEN=use_compress_len,
-        BLOCK=block,
         num_warps=4,
     )
     kv_indptr_prefix = _lengths_to_indptr(prefix_len)
@@ -428,16 +374,12 @@ def build_prefill_indices(
         chunk_start,
         cu_q,
         state_slot,
-        page_idx if write_compress else state_slot,  # dummy ptr when not writing
         kv_indptr_prefix,
         kv_indptr_extend,
         kv_indices_prefix,
         kv_indices_extend,
-        swa_pages,
         ring_stride,
         win=win,
-        Wc=Wc if write_compress else 1,
-        WRITE_COMPRESS=write_compress,
         BLOCK=block,
         num_warps=4,
     )
