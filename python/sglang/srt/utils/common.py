@@ -1006,7 +1006,7 @@ def mxfp_supported():
     """
     if torch.version.hip:
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
-        return any(gfx in gcn_arch for gfx in ["gfx95"])
+        return any(gfx in gcn_arch for gfx in ["gfx95", "gfx1250"])
     else:
         return False
 
@@ -1018,7 +1018,7 @@ def is_gfx95_supported():
     """
     if torch.version.hip:
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
-        return any(gfx in gcn_arch for gfx in ["gfx95"])
+        return any(gfx in gcn_arch for gfx in ["gfx95", "gfx1250"])
     else:
         return False
 
