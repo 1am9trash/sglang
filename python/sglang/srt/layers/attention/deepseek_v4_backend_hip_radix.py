@@ -113,16 +113,21 @@ class UnifiedKvMetadata:
     pf_cu_q: Optional[torch.Tensor] = None
     pf_final_pos: Optional[torch.Tensor] = None
 
+    # Layer-invariant prefill base, built once per forward in
+    # `_attach_unified_kv_prefill_meta` (mirrors the decode streams above).
+    # The per-ratio prefix streams reuse swa/csa/hca_indices (decode & prefill
+    # never run in the same forward); the extend stream + SWA-prefix length are
+    # shared across ratios. `pf_base_ready` is False on paths that skip the
+    # build (e.g. DSA-CP), where the forward falls back to a per-layer build.
+    pf_ext_indices: Optional[torch.Tensor] = None
+    pf_ext_indptr: Optional[torch.Tensor] = None
+    pf_swa_len: Optional[torch.Tensor] = None
+    pf_base_ready: bool = False
+
     # SWA-page-offset compressed-store locations (= c*_out_loc + unified_swa_pages),
     # precomputed once per step to drop the per-layer int add in the store path.
     c4_out_loc: Optional[torch.Tensor] = None
     c128_out_loc: Optional[torch.Tensor] = None
-
-    # Per-forward, per-compress_ratio cache of the layer-invariant prefill base
-    # (SWA-prefix + extend indices/indptr). Reset each forward in
-    # `_attach_unified_kv_prefill_meta`; deliberately excluded from `copy_`
-    # (rebuilt per forward, never copied across cuda-graph replays).
-    prefill_base: dict = field(default_factory=dict)
 
     def copy_(self, other: UnifiedKvMetadata) -> None:
         copy_metadata(
@@ -140,12 +145,16 @@ class UnifiedKvMetadata:
                 "pf_chunk_start",
                 "pf_cu_q",
                 "pf_final_pos",
+                "pf_ext_indices",
+                "pf_ext_indptr",
+                "pf_swa_len",
                 "c4_out_loc",
                 "c128_out_loc",
             ],
             # swa_loc is recomputed each forward (recorded inside cuda graphs),
-            # so it is rebound rather than copied across replays.
-            assign_fields=["swa_loc"],
+            # so it is rebound rather than copied across replays. pf_base_ready
+            # is a plain flag, rebound alongside it.
+            assign_fields=["swa_loc", "pf_base_ready"],
         )
 
 
@@ -1118,14 +1127,80 @@ class DeepseekV4HipRadixBackend(
         )
         if core.unified is None:
             core.unified = UnifiedKvMetadata()
-        # Reset the per-forward prefill-base cache (a reused metadata object may
-        # carry a stale cache from a previous forward).
-        core.unified.prefill_base = {}
-        core.unified.pf_state_slot = req_pool_indices[bid]
-        core.unified.pf_chunk_start = (seq_lens - extend_seq_lens)[bid]
+        u = core.unified
+        u.pf_state_slot = req_pool_indices[bid]
+        u.pf_chunk_start = (seq_lens - extend_seq_lens)[bid]
         cu_q_per_req = torch.cumsum(extend_seq_lens, dim=0) - extend_seq_lens
-        core.unified.pf_cu_q = cu_q_per_req[bid]
-        core.unified.pf_final_pos = (seq_lens - 1)[bid]
+        u.pf_cu_q = cu_q_per_req[bid]
+        u.pf_final_pos = (seq_lens - 1)[bid]
+
+        # Build the layer-invariant prefill base once (SWA-prefix + extend +
+        # compress reservation), mirroring _attach_unified_kv_decode_streams so
+        # the per-layer forward only refills the CSA tail. Skipped under DSA-CP
+        # (per-rank sliced positions) → forward falls back to a per-layer build.
+        from sglang.srt.layers.attention.dsa.utils import (
+            is_dsa_prefill_cp_round_robin_split,
+        )
+        from sglang.srt.layers.attention.dsv4.unified_kv_kernels import runtime
+
+        u.pf_base_ready = False
+        cp_active = (
+            get_parallel().attn_cp_size > 1 and is_dsa_prefill_cp_round_robin_split()
+        )
+        if cp_active or core.positions_casual is None:
+            return
+
+        pool = self.token_to_kv_pool
+        win = pool.unified_swa_window
+        ring = pool.unified_swa_ring_size
+        swa_pages = pool.unified_swa_pages
+        pos = core.positions_casual.to(torch.int64)
+
+        def _base(compress_ratio, c128_pi, c4_pi, compress_len):
+            return runtime.build_prefill_indices(
+                compress_ratio=compress_ratio,
+                state_slot=u.pf_state_slot,
+                positions=pos,
+                chunk_start=u.pf_chunk_start,
+                cu_q=u.pf_cu_q,
+                win=win,
+                ring_stride=ring,
+                swa_pages=swa_pages,
+                c128_page_indices=c128_pi,
+                c4_sparse_page_indices=c4_pi,
+                compress_len=compress_len,
+            )
+
+        # ratio 0: SWA-only prefix + the shared extend stream + SWA-prefix length.
+        u.swa_indices, u.swa_indptr, u.pf_ext_indices, u.pf_ext_indptr, u.pf_swa_len = (
+            _base(0, None, None, None)
+        )
+        # ratio 4: SWA + reserved CSA tail (filled per C4 layer in the forward).
+        if core.c4_sparse_topk_lengths_raw is not None:
+            u.csa_indices, u.csa_indptr, _, _, _ = _base(
+                4, None, core.c4_sparse_page_indices, core.c4_sparse_topk_lengths_raw
+            )
+        else:
+            u.csa_indices = u.csa_indptr = None
+        # ratio 128: SWA + HCA tail (positional → filled once here).
+        if (
+            core.c128_topk_lengths_raw is not None
+            and core.c128_page_indices is not None
+        ):
+            u.hca_indices, u.hca_indptr, _, _, _ = _base(
+                128, core.c128_page_indices, None, core.c128_topk_lengths_raw
+            )
+            runtime.fill_compress_tail(
+                indices=u.hca_indices,
+                indptr=u.hca_indptr,
+                prefix_len=u.pf_swa_len,
+                page_indices=core.c128_page_indices,
+                valid_len=core.c128_topk_lengths_raw,
+                swa_pages=swa_pages,
+            )
+        else:
+            u.hca_indices = u.hca_indptr = None
+        u.pf_base_ready = True
 
     def _forward_unified_kv(
         self,
@@ -1251,56 +1326,53 @@ class DeepseekV4HipRadixBackend(
                 : state_slot_full.shape[0]
             ].contiguous()
 
-        # The SWA-prefix + extend base is layer-invariant (depends only on
-        # positions/state_slot/chunk_start/cu_q), so build it once per forward
-        # per compress_ratio and cache it. Only the compressed tail differs:
-        #   - ratio 128 (HCA): positional page map → layer-invariant, filled once
-        #     when the base is built.
-        #   - ratio 4 (CSA): per-layer indexer top-k → refilled every C4 layer.
-        base_cache = core_attn_metadata.unified.prefill_base
-        base = base_cache.get(compress_ratio)
-        if base is None:
-            kpre_i, kpre_p, kext_i, kext_p, pre_swa_len, cmp_len = (
-                runtime.build_prefill_indices(
-                    compress_ratio=compress_ratio,
-                    state_slot=state_slot,
-                    positions=positions,
-                    chunk_start=chunk_start,
-                    cu_q=cu_q,
-                    win=win,
-                    ring_stride=ring_stride,
-                    c128_page_indices=c128_pi,
-                    c4_sparse_page_indices=c4_pi,
+        # Fast path: reuse the layer-invariant SWA+extend base built once in
+        # `_attach_unified_kv_prefill_meta` (per-ratio prefix stream reused via
+        # swa/csa/hca_indices). Only the CSA tail is refilled per C4 layer. The
+        # base is skipped under DSA-CP or on any size mismatch (padding) → fall
+        # back to the per-layer build below.
+        u = core_attn_metadata.unified
+        prefix_by_ratio = {
+            0: (u.swa_indices, u.swa_indptr),
+            4: (u.csa_indices, u.csa_indptr),
+            128: (u.hca_indices, u.hca_indptr),
+        }
+        kpre_i, kpre_p = prefix_by_ratio.get(compress_ratio, (None, None))
+        base_ok = (
+            not _cp_active
+            and u.pf_base_ready
+            and kpre_p is not None
+            and u.pf_ext_indptr is not None
+            and u.pf_ext_indptr.shape[0] == T + 1
+        )
+        if base_ok:
+            kext_i, kext_p = u.pf_ext_indices, u.pf_ext_indptr
+            if compress_ratio == 4:
+                runtime.fill_compress_tail(
+                    indices=kpre_i,
+                    indptr=kpre_p,
+                    prefix_len=u.pf_swa_len,
+                    page_indices=c4_pi[:T],
+                    valid_len=core_attn_metadata.c4_sparse_topk_lengths_raw[:T],
+                    swa_pages=swa_pages,
                 )
+        else:
+            kpre_i, kpre_p, kext_i, kext_p, _ = runtime.build_prefill_indices(
+                compress_ratio=compress_ratio,
+                state_slot=state_slot,
+                positions=positions,
+                chunk_start=chunk_start,
+                cu_q=cu_q,
+                win=win,
+                ring_stride=ring_stride,
+                swa_pages=swa_pages,
+                c128_page_indices=c128_pi,
+                c4_sparse_page_indices=c4_pi,
             )
             if kpre_p.shape[0] < T + 1:
                 pad = T + 1 - kpre_p.shape[0]
                 kpre_p = torch.cat([kpre_p, kpre_p[-1:].expand(pad)])
                 kext_p = torch.cat([kext_p, kext_p[-1:].expand(pad)])
-            if compress_ratio == 128:
-                runtime.fill_compress_tail(
-                    indices=kpre_i,
-                    indptr=kpre_p,
-                    prefix_len=pre_swa_len,
-                    page_indices=c128_pi[:T],
-                    valid_len=cmp_len,
-                    swa_pages=swa_pages,
-                )
-            base = (kpre_i, kpre_p, kext_i, kext_p, pre_swa_len, cmp_len)
-            base_cache[compress_ratio] = base
-
-        kpre_i, kpre_p, kext_i, kext_p, pre_swa_len, cmp_len = base
-
-        # CSA tail is the current layer's indexer top-k → refill every C4 layer.
-        if compress_ratio == 4:
-            runtime.fill_compress_tail(
-                indices=kpre_i,
-                indptr=kpre_p,
-                prefix_len=pre_swa_len,
-                page_indices=c4_pi[:T],
-                valid_len=cmp_len,
-                swa_pages=swa_pages,
-            )
         o = runtime.prefill(
             q=q,
             unified_kv=unified,
