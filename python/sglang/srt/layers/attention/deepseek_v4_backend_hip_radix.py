@@ -98,6 +98,11 @@ class UnifiedKvMetadata:
     csa_indices: Optional[torch.Tensor] = None
     csa_indptr: Optional[torch.Tensor] = None
 
+    # Per-token SWA ring state-slot for the target-verify-as-decode store path
+    # (req_pool_indices repeated per draft token). Only set for target-verify;
+    # None for plain decode (which stores via forward_batch.req_pool_indices).
+    decode_state_slot: Optional[torch.Tensor] = None
+
     # prefill/extend per-token mapping
     pf_state_slot: Optional[torch.Tensor] = None
     pf_chunk_start: Optional[torch.Tensor] = None
@@ -121,6 +126,7 @@ class UnifiedKvMetadata:
                 "hca_indptr",
                 "csa_indices",
                 "csa_indptr",
+                "decode_state_slot",
                 "pf_state_slot",
                 "pf_chunk_start",
                 "pf_cu_q",
@@ -533,6 +539,7 @@ class DeepseekV4HipRadixBackend(
         extend_seq_lens_cpu: List[int],
         need_compress: bool = True,
         use_prefill_cuda_graph: bool = False,
+        for_target_verify: bool = False,
     ) -> DSV4Metadata:
         seq_lens_casual, req_pool_indices_repeated = self.expand_prefill_casually(
             num_tokens=num_tokens,
@@ -550,9 +557,27 @@ class DeepseekV4HipRadixBackend(
             need_compress=need_compress,
             is_prefill=True,
         )
-        self._attach_unified_kv_prefill_meta(
-            core_attn_metadata, req_pool_indices, seq_lens, extend_seq_lens
-        )
+        if for_target_verify:
+            # verify runs through the paged-decode kernel on unified_kv: build the
+            # per-token ragged decode index streams and record the per-token ring
+            # state-slot for the store. Skips the pf_* prefill mapping, which the
+            # decode path never reads. Self-gates on is_unified_kv_triton, so
+            # core.unified stays None on other backends.
+            self._attach_unified_kv_decode_streams(
+                core_attn_metadata, req_pool_indices_repeated
+            )
+            if core_attn_metadata.unified is not None:
+                # ``req_pool_indices_repeated`` is one entry per (padded) draft
+                # token, matching core.positions_casual used by the store.
+                core_attn_metadata.unified.decode_state_slot = (
+                    req_pool_indices_repeated.to(torch.int32)
+                )
+        else:
+            # prefill / draft-extend run through the two-source paged-prefill
+            # kernel, which needs the pf_* per-token mapping.
+            self._attach_unified_kv_prefill_meta(
+                core_attn_metadata, req_pool_indices, seq_lens, extend_seq_lens
+            )
         indexer_metadata = (
             self.init_forward_metadata_indexer(core_attn_metadata)
             if need_compress
@@ -632,6 +657,7 @@ class DeepseekV4HipRadixBackend(
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             need_compress=True,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
+            for_target_verify=True,
         )
 
     def make_forward_metadata_from_raw_verify(
@@ -1138,26 +1164,51 @@ class DeepseekV4HipRadixBackend(
         if q.ndim == 4:
             q = q.squeeze(1)
         device = q.device
-        positions = forward_batch.positions.to(torch.int64)
         T = q.shape[0]
-        positions = positions[:T]
 
         c128_pi = getattr(core_attn_metadata, "c128_page_indices", None)
         c4_pi = getattr(core_attn_metadata, "c4_sparse_page_indices", None)
 
+        # unified_kv always runs target-verify through the decode kernel: verify
+        # has a tiny per-request query length (num_draft_tokens), so the per-token
+        # ragged decode path fits better than the two-source prefill builder. The
+        # per-token decode streams are attached at metadata-build time.
+        unified_meta = core_attn_metadata.unified
+        verify_as_decode = (
+            forward_batch.forward_mode.is_target_verify()
+            and unified_meta is not None
+            and unified_meta.decode_state_slot is not None
+        )
+
         # decode
-        is_decode = forward_batch.forward_mode.is_decode_or_idle()
+        is_decode = forward_batch.forward_mode.is_decode_or_idle() or verify_as_decode
         if is_decode:
-            state_slot = forward_batch.req_pool_indices[:T]
+            if verify_as_decode:
+                # Per-token state slot + metadata positions keep the SWA ring
+                # store consistent with the decode index streams (which were
+                # built from core.positions_casual). Each draft token's window is
+                # bounded by its own position, so causality among the draft
+                # tokens holds even though all of them are written to the ring
+                # before the read (ring_stride = win + max_spec_steps prevents
+                # collisions with the committed window).
+                state_slot = unified_meta.decode_state_slot[:T]
+                # int32 positions; store_swa_into_unified promotes to int64
+                # internally when computing the ring offset.
+                store_positions = core_attn_metadata.positions_casual[:T]
+            else:
+                state_slot = forward_batch.req_pool_indices[:T]
+                # Raw positions; store_swa_into_unified promotes to int64
+                # internally when computing the ring offset.
+                store_positions = forward_batch.positions[:T]
             if save_kv_cache:
                 runtime.store_swa_into_unified(
                     kv=kv,
                     state_slot=state_slot,
-                    positions=positions,
+                    positions=store_positions,
                     unified_kv=unified,
                     win=win,
                     ring_stride=ring_stride,
-                    final_pos=positions,
+                    final_pos=store_positions,
                 )
             unified_metadata = core_attn_metadata.unified
             if compress_ratio == 0:
@@ -1189,6 +1240,7 @@ class DeepseekV4HipRadixBackend(
             )
 
         # prefill / extend
+        positions = forward_batch.positions.to(torch.int64)[:T]
         state_slot = core_attn_metadata.unified.pf_state_slot
         chunk_start = core_attn_metadata.unified.pf_chunk_start
         cu_q = core_attn_metadata.unified.pf_cu_q

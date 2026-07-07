@@ -68,7 +68,11 @@ def _swa_scatter_kernel(
         if pos <= fp - win:
             return
     s = tl.load(state_slot_ptr + row)
-    loc = s * ring_stride + (pos % ring_stride)
+    # Compute the ring row in int64 so the flat store offset ``loc * D`` cannot
+    # overflow int32 for large unified_kv pools (num_pages * D may exceed 2**31),
+    # independent of the caller's positions / state_slot dtype. This lets callers
+    # pass int32 indices without a separate up-cast kernel.
+    loc = s.to(tl.int64) * ring_stride + (pos.to(tl.int64) % ring_stride)
     offs = tl.arange(0, BLOCK_D)
     mask = offs < D
     vals = tl.load(kv_ptr + row * D + offs, mask=mask, other=0.0)

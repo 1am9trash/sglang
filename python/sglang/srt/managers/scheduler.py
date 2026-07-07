@@ -1514,17 +1514,18 @@ class Scheduler(
     def _apply_war_barrier(self):
         # Wait for the prev forward to finish reading the shared buffers this
         # iter's schedule will overwrite. Fast path: wait on the read-done event
-        # the forward published after its snapshot (non-spec: decode graph;
-        # spec: draft_extend), then clear it. Else fall back to whole-forward
-        # wait_stream.
-        if not self._war_barrier_enabled:
-            return
-        runner = self.model_worker.war_fastpath_runner
-        ev = runner.war_fastpath_read_done_event
+        # the forward published after it finished its shared-pool reads (non-spec:
+        # decode graph; spec: draft_extend), then clear it. A published event is
+        # a precise, cheap signal, so honor it regardless of the platform gate
+        # (this is what protects the DSV4 draft-extend graph on HIP, where the
+        # replay reads live req_to_token / unified_kv). Only the expensive
+        # whole-forward wait_stream fallback stays gated by _war_barrier_enabled.
+        runner = getattr(self.model_worker, "war_fastpath_runner", None)
+        ev = getattr(runner, "war_fastpath_read_done_event", None)
         if ev is not None:
             self.schedule_stream.wait_event(ev)
             runner.war_fastpath_read_done_event = None
-        else:
+        elif self._war_barrier_enabled:
             self.schedule_stream.wait_stream(self.forward_stream)
 
     @DynamicGradMode()

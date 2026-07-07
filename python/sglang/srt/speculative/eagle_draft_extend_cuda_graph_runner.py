@@ -573,12 +573,6 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         )
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
 
-        # Snapshot built -- the forward is done reading the shared pool. Publish
-        # a read-done event the scheduler's WAR barrier waits on.
-        read_done = self.device_module.Event()
-        read_done.record()
-        self.model_runner.war_fastpath_read_done_event = read_done
-
         self.raw_bs = raw_bs
         self.bs = bs
         shape_key = self._make_graph_key(bs)
@@ -591,6 +585,17 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         )
         with timer_ctx:
             out = self._replay_graph(shape_key, forward_batch)
+
+        # Publish the WAR read-done event AFTER replay, not after the out-graph
+        # snapshot: the DSV4 unified_kv path rebuilds metadata in-graph and reads
+        # live req_to_token / unified_kv *during* the replay (see
+        # init_forward_metadata_in_graph / _forward_unified_kv). Recording before
+        # replay let the scheduler's WAR barrier reuse/overwrite in-flight req
+        # slots mid-replay -> data race (surfaces under HIP overlap when the req
+        # pool saturates and freed slots are immediately reallocated).
+        read_done = self.device_module.Event()
+        read_done.record()
+        self.model_runner.war_fastpath_read_done_event = read_done
 
         out = LogitsProcessorOutput(
             next_token_logits=out.next_token_logits[:num_tokens],
