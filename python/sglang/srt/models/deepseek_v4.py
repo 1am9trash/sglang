@@ -188,7 +188,7 @@ _is_gfx942_supported = is_gfx942_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
 
 if _use_aiter:
-    if _is_gfx95_supported:
+    if _is_gfx95_supported or _is_gfx1250_supported:
         from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
 
@@ -689,7 +689,7 @@ class MQALayer(nn.Module):
             qkv_a = None
 
         if self.use_fused_qk_norm_rope:
-            if _is_gfx95_supported:
+            if _is_gfx95_supported or _is_gfx1250_supported:
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
                     q_lora,
                     self.q_norm.weight,
@@ -788,7 +788,7 @@ class MQALayer(nn.Module):
         )
 
         if do_fused_store:
-            if _is_gfx95_supported:
+            if _is_gfx95_supported or _is_gfx1250_supported:
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
                     q_lora,
                     self.q_norm.weight,
@@ -1440,7 +1440,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
             if not norm_fused:
-                if _use_aiter and _is_gfx95_supported:
+                if _use_aiter and (_is_gfx95_supported or _is_gfx1250_supported):
                     x_quant, hidden_states = _fused_rmsnorm_fp8_quant(
                         hidden_states,
                         self.input_layernorm.weight,
@@ -1690,7 +1690,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
         if not norm_fused:
-            if _use_aiter and _is_gfx95_supported:
+            if _use_aiter and (_is_gfx95_supported or _is_gfx1250_supported):
                 x_quant, hidden_states = _fused_rmsnorm_fp8_quant(
                     hidden_states,
                     self.input_layernorm.weight,
