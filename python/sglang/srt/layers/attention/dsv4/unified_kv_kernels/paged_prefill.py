@@ -48,6 +48,7 @@ Numerics: identical online-softmax + sink finalization to
 import torch
 import triton
 import triton.language as tl
+from aiter.ops.triton.attention.pa_prefill_sparse import pa_prefill_sparse
 
 from sglang.srt.utils.common import is_gfx95_supported, is_gfx1250_supported
 
@@ -60,6 +61,8 @@ try:
 except ImportError:
     pa_sparse_prefill_opus = None
     _HAS_OPUS = False
+
+_is_gfx1250_supported = is_gfx1250_supported()
 
 
 @triton.jit
@@ -316,6 +319,18 @@ def sparse_attn_v4_paged_prefill(
     Returns:
       out: [T, H, D] same dtype as q.
     """
+    if _is_gfx1250_supported:
+        return pa_prefill_sparse(
+            q,
+            unified_kv,
+            kv_indices_prefix,
+            kv_indptr_prefix,
+            kv,
+            kv_indices_extend,
+            kv_indptr_extend,
+            attn_sink,
+            softmax_scale,
+        )
     if _HAS_OPUS:
         # OPUS contract differs from the Triton kernel in two ways the Triton
         # path tolerates implicitly:
