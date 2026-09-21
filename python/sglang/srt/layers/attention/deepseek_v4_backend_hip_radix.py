@@ -104,6 +104,11 @@ class UnifiedKvMetadata:
     csa_indices: Optional[torch.Tensor] = None
     csa_indptr: Optional[torch.Tensor] = None
 
+    # fp8 decode split plan, built once a step rather than once a layer. 
+    # HCA only: swa clamps to SWA_WINDOW and csa to index_topk, so their
+    # tokens share one kv_len and trimming has nothing to trim.
+    hca_split_indptr: Optional[torch.Tensor] = None
+
     # prefill/extend per-token mapping
     pf_state_slot: Optional[torch.Tensor] = None
     pf_chunk_start: Optional[torch.Tensor] = None
@@ -133,6 +138,7 @@ class UnifiedKvMetadata:
                 "hca_indptr",
                 "csa_indices",
                 "csa_indptr",
+                "hca_split_indptr",
                 "pf_state_slot",
                 "pf_chunk_start",
                 "pf_cu_q",
@@ -162,6 +168,7 @@ class UnifiedKvMetadata:
                 "hca_indptr",
                 "csa_indices",
                 "csa_indptr",
+                "hca_split_indptr",
                 "pf_state_slot",
                 "pf_chunk_start",
                 "pf_cu_q",
@@ -1474,6 +1481,7 @@ class DeepseekV4HipRadixBackend(
         # state_slot maps each query token to its request slot;
         # target-verify repeats request slots for the draft tokens.
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_fp8,
             is_unified_kv_triton,
         )
 
@@ -1531,6 +1539,10 @@ class DeepseekV4HipRadixBackend(
         # forward store (target-verify) instead of recomputing a repeat_interleave
         # per layer. Harmless for plain decode (its store reads req_pool_indices).
         core.unified.verify_store_state_slot = state_slot
+        if is_unified_kv_fp8():
+            core.unified.hca_split_indptr = runtime.decode_split_indptr(
+                core.unified.hca_indptr, N
+            )
 
     def _attach_unified_kv_prefill_meta(
         self,
@@ -1663,12 +1675,14 @@ class DeepseekV4HipRadixBackend(
                     ),
                 )
             unified_metadata = core_attn_metadata.unified
+            split_indptr = None
             if compress_ratio == 0:
                 kv_indices = unified_metadata.swa_indices
                 kv_indptr = unified_metadata.swa_indptr
             elif compress_ratio == 128:
                 kv_indices = unified_metadata.hca_indices
                 kv_indptr = unified_metadata.hca_indptr
+                split_indptr = unified_metadata.hca_split_indptr
             elif compress_ratio == 4:
                 kv_indices = unified_metadata.csa_indices
                 kv_indptr = unified_metadata.csa_indptr
@@ -1700,6 +1714,7 @@ class DeepseekV4HipRadixBackend(
                     kv_indptr=kv_indptr,
                     attn_sink=attn_sink,
                     v_head_dim=layer.v_head_dim,
+                    split_indptr=split_indptr,
                 )
             from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_decode import (
                 _kv_splits_for_stream,

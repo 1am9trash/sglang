@@ -261,8 +261,31 @@ def decode_qo_indptr(num_tokens: int, device: torch.device) -> torch.Tensor:
 # aiter sizes the split count off CU occupancy and over-splits just past 40
 # tokens, where the stage-2 merge starts to dominate. 4 rather than each shape's
 # own optimum -- neighbouring split counts swing ~1.5x either way.
-_DECODE_SPLIT_TAIL_MIN_TOKENS = 40
 _DECODE_SPLIT_TAIL_VALUE = 4
+
+def _trimmed_split_indptr(kv_indptr, T, num_kv_splits):
+    """
+    Per-token pass counts, trimming aiter's uniform ``num_kv_splits``.
+    """
+    if num_kv_splits is None or num_kv_splits <= 1:
+        return None
+    # Never above num_kv_splits, so never past the per-token stride of the
+    # [total_q, num_kv_splits, ...] partial buffer.
+    lengths = (kv_indptr[1 : T + 1] - kv_indptr[:T]).to(torch.float32)
+    share = lengths * (num_kv_splits * T) / lengths.sum().clamp(min=1.0)
+    n = share.floor_().clamp_(1, num_kv_splits)
+    split_indptr = torch.zeros(T + 1, dtype=torch.int32, device=kv_indptr.device)
+    split_indptr[1:] = n.cumsum(0).to(torch.int32)
+    return split_indptr
+
+
+def decode_split_indptr(kv_indptr, T, num_kv_splits=None):
+    """
+    The split plan for one decode stream, shared by every layer reading it.
+    """
+    if num_kv_splits is None:
+        num_kv_splits = _DECODE_SPLIT_TAIL_VALUE
+    return _trimmed_split_indptr(kv_indptr, T, num_kv_splits)
 
 
 def decode_fp8_2buff(
@@ -277,6 +300,7 @@ def decode_fp8_2buff(
     v_head_dim: int,
     qo_indptr: Optional[torch.Tensor] = None,
     num_kv_splits: Optional[int] = None,
+    split_indptr: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Decode over the two-pool fp8 unified_kv, through aiter's v4 nm asm kernel.
 
@@ -334,7 +358,7 @@ def decode_fp8_2buff(
     # Left None, the wrapper's occupancy heuristic picks it, folds the cross-split
     # merge back into `out`, and leaves the final bf16 there whether or not it
     # split. Pinning it to 1 costs 6.9x at bs=1 kv=2048.
-    if num_kv_splits is None and T > _DECODE_SPLIT_TAIL_MIN_TOKENS:
+    if num_kv_splits is None:
         num_kv_splits = _DECODE_SPLIT_TAIL_VALUE
     mla_decode_fwd_v4_nm(
         q,
@@ -348,6 +372,7 @@ def decode_fp8_2buff(
         1,  # max_seqlen_q; qo_indptr is per-token so every sequence is one token
         sink=attn_sink,
         num_kv_splits=num_kv_splits,
+        split_indptr=split_indptr,
     )
     # No empty-segment mask: a CG-padded row gets seq_len 1 on the ring slot
     # ReqToTokenPool reserves, so the builders can't emit a zero-length one, and
