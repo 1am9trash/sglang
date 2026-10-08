@@ -6,6 +6,8 @@ grid) or an Mxfp8Activation."""
 
 from __future__ import annotations
 
+import functools
+import logging
 from typing import Optional
 
 import torch
@@ -16,13 +18,22 @@ from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
     bf16_dequant_blockscaled_linear,
     dequant_block_fp8_weight_to_bf16,
     dequant_mxfp8_to_bf16,
+    mxfp8_e4m3_quantize,
+    mxfp8_scale_words,
 )
 from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
     native_route_supports,
     prepare_mxfp8_native_weight,
     ue8m0_weight_scale,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.utils import copy_or_rebind_param
+
+logger = logging.getLogger(__name__)
+
+# Fewer rows (decode, short prefill chunks) stay on aiter: there the FlyDSL kernel's 128-
+# and 256-row tiles leave CUs idle and it loses on the narrow GEMMs (N = 1792, 4096).
+_FLYDSL_MIN_M = 2048
 
 
 def process_dense_weights(method, layer: torch.nn.Module, scale_u8) -> None:
@@ -40,6 +51,7 @@ def process_dense_weights(method, layer: torch.nn.Module, scale_u8) -> None:
             "weight_scale_mx_e8m0",
             ue8m0_weight_scale(layer.weight_scale_inv.data),
         )
+        _prepare_flydsl(layer)
         return
     assert backend.is_gfx95_mxfp8_native()
     n, k = layer.weight.shape
@@ -92,6 +104,11 @@ def apply_dense(
     if native_route:
         return _apply_native(method, layer, x, bias, input_scale, on_fp8_grid)
     if aiter_route:
+        if (
+            getattr(layer, "weight_scale_flydsl", None) is not None
+            and x.numel() // x.shape[-1] >= _FLYDSL_MIN_M
+        ):
+            return _apply_flydsl(layer, x, bias, input_scale)
         return method.w8a8_mxfp8_linear(
             input=x,
             weight=layer.weight,
@@ -116,6 +133,55 @@ def apply_dense(
         input_scale=input_scale,
         bias=bias,
     )
+
+
+@functools.cache
+def _flydsl_gemm():
+    """The mxfp8_gemm_gfx950 module, or None (warned once) when FlyDSL is missing."""
+    try:
+        from sglang.kernels.ops.quantization import mxfp8_gemm_gfx950
+    except ImportError as e:
+        logger.warning("SGLANG_OPT_HIP_FLYDSL_MXFP8 ignored, FlyDSL unavailable: %s", e)
+        return None
+    return mxfp8_gemm_gfx950
+
+
+def _prepare_flydsl(layer: torch.nn.Module) -> None:
+    """Weight scales in mxfp8_gemm_gfx950's layout when SGLANG_OPT_HIP_FLYDSL_MXFP8 is
+    set and the kernel takes this weight; weight_scale_flydsl stays None otherwise."""
+    layer.weight_scale_flydsl = None
+    n, k = layer.weight.shape
+    if (
+        not envs.SGLANG_OPT_HIP_FLYDSL_MXFP8.get()
+        or k % 128
+        or n % 8
+        or not layer.weight.is_contiguous()
+        or _flydsl_gemm() is None
+    ):
+        return
+    # one row of block scales per output row
+    rows = layer.weight_scale_mx_e8m0.repeat_interleave(32, dim=0)[:n]
+    layer.weight_scale_flydsl = _flydsl_gemm().mxfp8_scale_layout(rows)
+
+
+def _apply_flydsl(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    input_scale: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """The aiter route's GEMM on mxfp8_gemm_gfx950."""
+    x2d = x.reshape(-1, x.shape[-1])
+    if input_scale is None:
+        xq, xs = mxfp8_e4m3_quantize(x2d.to(torch.bfloat16))
+    else:
+        xq, xs = x2d.contiguous(), input_scale.reshape(-1, input_scale.shape[-1])
+    out = _flydsl_gemm().mxfp8_gemm(
+        xq, mxfp8_scale_words(xs), layer.weight, layer.weight_scale_flydsl
+    )
+    if bias is not None:
+        out = out + bias
+    return out.view(*x.shape[:-1], out.shape[-1])
 
 
 def _apply_native(

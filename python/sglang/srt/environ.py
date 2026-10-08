@@ -1605,6 +1605,9 @@ class Envs:
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
     # dequant of the chunk's SWA and compressed history, instead of the decode kernel.
     SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL = EnvBool(False)
+    # gfx950 MXFP8 dense GEMMs on the aiter route run the FlyDSL kernel
+    # (mxfp8_gemm_gfx950) at prefill sizes; decode stays on aiter.
+    SGLANG_OPT_HIP_FLYDSL_MXFP8 = EnvBool(False)
     # DSpark draft block on the HIP radix backend: build the attention metadata inside the
     # draft CUDA graph from the raw inputs instead of eagerly before every replay.
     SGLANG_HIP_DSPARK_DRAFT_RAW_METADATA = EnvBool(_default_hip)
